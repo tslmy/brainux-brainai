@@ -1,4 +1,20 @@
-/* brainai: offline Japanese chat with brain-ai v1 preview on Brainux. */
+/*
+ * brainai: offline Japanese chat with brain-ai v1 preview on Brainux.
+ *
+ * This file is the app around the engine:
+ *   - parses the command line and loads the tokenizer and model;
+ *   - picks a front end: the framebuffer UI (ui_fb.c) on the Brain's own
+ *     screen, or the plain terminal UI (ui_tty.c) over SSH (Secure Shell);
+ *   - runs the chat loop: encode your message, feed it to the model, then
+ *     sample the reply token by token (sample());
+ *   - runs the tools the model calls (calc, time, memo, search);
+ *   - stands in for the original app's exact-arithmetic unit, "IGC".
+ *
+ * The conversation format the model was trained on, as token ids:
+ *   <user> message <end> <bot> reply <end>
+ *   reply may contain  <call> tool: argument <end>  after which the app
+ *   feeds  <result> tool output <end> <bot>  and the model continues.
+ */
 #include <math.h>
 #include <signal.h>
 #include <stdio.h>
@@ -15,19 +31,21 @@
 #define BRAINAI_DATADIR "/usr/share/brainai"
 #endif
 
-#define MAX_PROMPT 1024
-#define MAX_CALLS 3
+#define MAX_PROMPT 1024 /* longest message, in bytes and in tokens */
+#define MAX_CALLS 3     /* tool calls allowed per reply */
 
 static model_t *M;
 static tokenizer_t *T;
 static const ui_t *U;
+/* sampling settings, changeable with -t, -r and /temp */
 static float temperature = 0.7f, top_p = 0.9f, rep_penalty = 1.1f;
 static int top_k = 40, max_new = 300, show_stats = 0;
-static uint32_t rng = 2463534242u;
+static uint32_t rng = 2463534242u; /* random state; reseeded from the clock */
 static unsigned char *digit_tok; /* 1: starts with a digit, 2: with '.' or ',' */
-static int recent[64], nrecent;
+static int recent[64], nrecent;  /* the reply's last 64 tokens */
 static unsigned char *is_recent; /* V entries, set only inside sample() */
 
+/* Wall-clock time in seconds, for the --stats line. */
 static double now(void)
 {
 	struct timeval tv;
@@ -35,12 +53,27 @@ static double now(void)
 	return tv.tv_sec + tv.tv_usec * 1e-6;
 }
 
+/* Uniform random float in [0, 1), from a xorshift32 generator. */
 static float frand(void)
 {
 	rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
 	return (rng >> 8) * (1.0f / 16777216.0f);
 }
 
+/*
+ * Picks the next token from the logits.
+ *
+ *  1. Skip tokens that must never be generated here (special tokens, and
+ *     digits right after a forced IGC number when mask_digits is set).
+ *  2. Repetition penalty: tokens used in the last 64 become less likely
+ *     (positive logits divided by rep_penalty, negative ones multiplied).
+ *     is_recent marks them so each check is one array read.
+ *  3. Keep the top_k (at most 64) best tokens in a sorted list.
+ *  4. With temperature 0, return the best one (greedy).  Otherwise turn the
+ *     kept logits into probabilities, p_i ~ exp((logit_i - max) / temperature),
+ *     cut the tail once the running total reaches top_p of the whole
+ *     ("nucleus" sampling), and draw at random.
+ */
 static int sample(const float *lg, int mask_digits)
 {
 	int V = model_vocab(M), i, j, n = 0;
@@ -60,6 +93,7 @@ static int sample(const float *lg, int mask_digits)
 			continue;
 		if (is_recent[i])
 			v = v > 0 ? v / rep_penalty : v * rep_penalty;
+		/* insertion into the sorted top-k list (val descending) */
 		if (n == k && v <= val[n - 1])
 			continue;
 		if (n < k)
@@ -71,7 +105,7 @@ static int sample(const float *lg, int mask_digits)
 		val[j] = v;
 		idx[j] = i;
 	}
-	for (j = 0; j < nrecent; j++)
+	for (j = 0; j < nrecent; j++) /* clear the marks for next time */
 		is_recent[recent[j]] = 0;
 	if (n == 1 || temperature <= 0)
 		return idx[0];
@@ -97,7 +131,11 @@ static int sample(const float *lg, int mask_digits)
 	return idx[n - 1];
 }
 
-/* Feed tokens; logits of the last one are returned. */
+/*
+ * Feeds tokens; logits of the last one are returned.  Only the last token
+ * asks for logits, which skips the expensive LM (language model) head for
+ * the rest of the prompt.
+ */
 static const float *feed(const int *ids, int n)
 {
 	const float *lg = NULL;
@@ -107,6 +145,7 @@ static const float *feed(const int *ids, int n)
 	return lg;
 }
 
+/* Feeds [pre] + encoded text + [post1] + [post2]; a negative id is skipped. */
 static const float *feed_text(int pre, const char *text, int post1, int post2)
 {
 	int ids[MAX_PROMPT + 4], n = 0;
@@ -126,6 +165,15 @@ static void memo_path(char *buf, size_t max)
 	snprintf(buf, max, "%s/.brainai-memo.txt", home ? home : "/root");
 }
 
+/*
+ * Runs one tool call written by the model, "name: argument", and writes the
+ * result text (in Japanese, as the model expects) into res.
+ *   calc    evaluate an arithmetic expression (angles in degrees)
+ *   time    current date and time
+ *   memo    with an argument: append it to ~/.brainai-memo.txt;
+ *           without: read all memos back
+ *   search  look the argument up in an optional search.tsv
+ */
 static void run_tool(const char *call, char *res, size_t max)
 {
 	const char *colon = strchr(call, ':');
@@ -168,6 +216,7 @@ static void run_tool(const char *call, char *res, size_t max)
 				snprintf(res, max, "エラー: メモを保存できません");
 			}
 		} else {
+			/* join all memo lines with "、" */
 			size_t o = 0;
 			char line[256];
 			f = fopen(path, "r");
@@ -203,9 +252,14 @@ static void run_tool(const char *call, char *res, size_t max)
 	}
 }
 
-/* Streams token text to the UI, holding back incomplete UTF-8. */
+/*
+ * Streams token text to the UI, holding back incomplete UTF-8.
+ * A Japanese character is 3 bytes in UTF-8 (Unicode Transformation Format,
+ * 8-bit), and byte-fallback tokens deliver it one byte at a time, so
+ * printing must wait until a character is complete.
+ */
 typedef struct {
-	char buf[64];
+	char buf[64];  /* bytes not yet shown */
 	int n, color;
 	char tail[16]; /* last bytes shown, for the IGC trigger */
 } out_t;
@@ -215,7 +269,12 @@ static void out_bytes(out_t *o, const char *s, int n)
 	int i, cut;
 	for (i = 0; i < n && o->n < (int)sizeof(o->buf) - 1; i++)
 		o->buf[o->n++] = s[i];
-	/* find the last complete UTF-8 boundary */
+	/*
+	 * Find the last complete UTF-8 boundary: walk back over continuation
+	 * bytes (10xxxxxx) to the lead byte, whose top bits say how long its
+	 * character is (110x: 2, 1110: 3, 11110: 4).  If not all of it has
+	 * arrived yet, show only what comes before it.
+	 */
 	cut = o->n;
 	for (i = o->n - 1; i >= 0 && i >= o->n - 4; i--) {
 		unsigned char c = o->buf[i];
@@ -244,6 +303,10 @@ static void out_bytes(out_t *o, const char *s, int n)
 	}
 }
 
+/*
+ * True when the reply so far ends in a place where a number is expected,
+ * e.g. "答えは" ("the answer is"), "=" or the very start of the reply.
+ */
 static int igc_trigger(const char *tail)
 {
 	static const char *const keys[] = {"=", "＝", "は", "答え", "結果", "約", ":", "：", "、"};
@@ -260,9 +323,14 @@ static int igc_trigger(const char *tail)
 	return 0;
 }
 
+/*
+ * Answers one user message: feeds it, then generates until the model ends
+ * its turn, max_new tokens are produced, or the user cancels.
+ */
 static void reply(const char *user)
 {
 	char igc[64], igc_expr[256], call[512], res[1024], piece[64];
+	/* if the message contains arithmetic, compute it exactly now */
 	int igc_pending = igc_find(user, igc_expr, sizeof(igc_expr), igc, sizeof(igc));
 	int in_call = 0, ncall = 0, mask_digits = 0, produced = 0, i, cl = 0;
 	const float *lg;
@@ -271,13 +339,14 @@ static void reply(const char *user)
 
 	memset(&o, 0, sizeof(o));
 	t0 = now();
+	/* "prefill": <user> message <end> <bot> */
 	lg = feed_text(TOK_USER, user, TOK_END, TOK_BOT);
 	t1 = now();
 	nrecent = 0;
 	while (produced < max_new) {
 		int t;
 		if (U->cancelled()) {
-			model_step(M, TOK_END, 0);
+			model_step(M, TOK_END, 0); /* close the turn so the state stays valid */
 			U->write(" …", 2);
 			break;
 		}
@@ -287,17 +356,17 @@ static void reply(const char *user)
 			model_step(M, TOK_END, 0);
 			break;
 		}
-		if (t == TOK_END && !in_call) {
+		if (t == TOK_END && !in_call) { /* the model finished its reply */
 			model_step(M, TOK_END, 0);
 			break;
 		}
-		if (t == TOK_CALL && !in_call) {
+		if (t == TOK_CALL && !in_call) { /* a tool call starts */
 			in_call = 1;
 			cl = 0;
 			lg = model_step(M, t, 1);
 			continue;
 		}
-		if (t == TOK_END && in_call) {
+		if (t == TOK_END && in_call) { /* the tool call is complete: run it */
 			call[cl] = 0;
 			model_step(M, TOK_END, 0);
 			/* an explicit expression in the message beats the model's guess */
@@ -317,10 +386,11 @@ static void reply(const char *user)
 			igc_pending = 0; /* the tool result is authoritative */
 			if (++ncall > MAX_CALLS)
 				break;
+			/* give the model the result: <result> output <end> <bot> */
 			lg = feed_text(TOK_RESULT, res, TOK_END, TOK_BOT);
 			continue;
 		}
-		if (in_call) {
+		if (in_call) { /* inside a tool call: collect its text, don't show it */
 			int n = tok_piece(T, t, piece, sizeof(piece));
 			if (cl + n < (int)sizeof(call)) {
 				memcpy(call + cl, piece, n);
@@ -340,6 +410,7 @@ static void reply(const char *user)
 			mask_digits = 1;
 			continue;
 		}
+		/* an ordinary token: show it and feed it back */
 		{
 			int n = tok_piece(T, t, piece, sizeof(piece));
 			out_bytes(&o, piece, n);
@@ -396,10 +467,11 @@ int main(int argc, char **argv)
 			return 2;
 		}
 	}
+	/* no -s given: seed from the time and process id */
 	if (rng == 2463534242u)
 		rng ^= (uint32_t)time(NULL) ^ ((uint32_t)getpid() << 16);
 	if (!rng)
-		rng = 1;
+		rng = 1; /* xorshift never leaves 0 */
 
 	snprintf(path, sizeof(path), "%s/tok.bin", dir);
 	T = tok_load(path);
@@ -411,6 +483,7 @@ int main(int argc, char **argv)
 	M = model_load(path);
 	if (!M)
 		return 1;
+	/* mark tokens that start with a digit (1) or '.' / ',' (2), for IGC */
 	V = model_vocab(M);
 	digit_tok = calloc(V, 1);
 	for (i = 0; i < V; i++) {
@@ -420,6 +493,7 @@ int main(int argc, char **argv)
 			       n > 0 && (b[0] == '.' || b[0] == ',') ? 2 : 0;
 	}
 
+	/* the framebuffer UI only on the Brain's own console, and not with -p */
 	U = (!prompt && !force_tty) ? ui_fb_open() : NULL;
 	if (!U)
 		U = ui_tty_open();
@@ -438,6 +512,7 @@ int main(int argc, char **argv)
 			break;
 		if (!line[0])
 			continue;
+		/* slash commands */
 		if (!strcmp(line, "/quit") || !strcmp(line, "/exit"))
 			break;
 		if (!strcmp(line, "/help")) { help(); continue; }
@@ -460,6 +535,7 @@ int main(int argc, char **argv)
 			U->write(s, 2);
 			continue;
 		}
+		/* romaji -> hiragana, showing the result in terminal mode */
 		if (kana && romaji_to_kana(line, conv, sizeof(conv)) == 0) {
 			msg = conv;
 			if (strcmp(conv, line) && U->echo_conversion) {

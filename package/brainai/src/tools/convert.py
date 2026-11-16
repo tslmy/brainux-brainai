@@ -40,7 +40,13 @@ def f32(values):
 
 
 def ternary(name, shape, a):
-    """Pack a BitNet b1.58 weight (scale * {-1,0,1}) as scale + base-3 bytes."""
+    """Pack a BitNet b1.58 weight (scale * {-1,0,1}) as scale + base-3 bytes.
+
+    Each weight w becomes a digit d = w + 1 (0, 1 or 2). Four digits of one
+    row make one byte, c = d0 + 3*d1 + 9*d2 + 27*d3 (0..80), because
+    3**4 = 81 fits in a byte. The engine uses c directly as an index into
+    its 81-entry lookup table (docs/how-it-works.md, section 4).
+    """
     rows, cols = shape
     if cols % 4:
         sys.exit(f"{name}: columns not a multiple of 4")
@@ -66,6 +72,9 @@ def ternary(name, shape, a):
 
 
 def int8_rows(shape, a):
+    """Quantise a matrix to int8 with one scale per row: v ~= q * scale,
+    scale = max|row| / 127. Used for the embedding, which is also the
+    LM (language model) head."""
     rows, cols = shape
     scales, q = [], bytearray(rows * cols)
     for r in range(rows):
@@ -80,6 +89,11 @@ def int8_rows(shape, a):
 
 
 def convert_model(tensors, cfg, out):
+    """Write model.bin in the order engine.c's model_load() reads it.
+
+    A_log is stored as A = -exp(A_log), the per-head decay rate the engine
+    uses directly. Everything that is not ternary or the embedding stays
+    float32."""
     V, D, L = cfg["vocab_size"], cfg["hidden_size"], cfg["num_hidden_layers"]
     N, H, P, K = cfg["state_size"], cfg["num_heads"], cfg["head_dim"], cfg["conv_kernel"]
     E = cfg["expand"] * D
@@ -108,7 +122,16 @@ def convert_model(tensors, cfg, out):
             f.write(b)
 
 
+# tokenizer.model is a protobuf (Google's binary serialisation format).
+# Rather than depend on the protobuf library, the two helpers below decode
+# the wire format directly: each field is a "key" varint (field number << 3 |
+# wire type) followed by a varint (type 0), a length-prefixed byte string
+# (type 2), or 4 or 8 raw bytes (types 5 and 1).
+
+
 def pb_varint(b, i):
+    """Decode a varint (7 bits per byte, low bits first, high bit = "more")
+    at b[i]; return (value, next index)."""
     r = s = 0
     while True:
         c = b[i]
@@ -120,6 +143,7 @@ def pb_varint(b, i):
 
 
 def pb_fields(b):
+    """Yield (field number, value) for every field of one protobuf message."""
     i = 0
     while i < len(b):
         k, i = pb_varint(b, i)
@@ -139,6 +163,10 @@ def pb_fields(b):
 
 
 def convert_tokenizer(path, out):
+    """Write tok.bin: "BRTK", u32 count, then per piece f32 score, u8 type,
+    u8 length and the piece's UTF-8 bytes. In SentencePiece's ModelProto,
+    field 1 is a piece (1 = text, 2 = score, 3 = type), field 2 the trainer
+    settings and field 3 the normaliser settings."""
     pieces, trainer, normalizer = [], {}, {}
     for f, v in pb_fields(open(path, "rb").read()):
         if f == 1:

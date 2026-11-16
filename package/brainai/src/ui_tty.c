@@ -1,4 +1,8 @@
-/* Plain UTF-8 terminal front end (SSH, serial, USB networking). */
+/*
+ * Plain UTF-8 terminal front end, used over SSH (Secure Shell), a serial
+ * console or USB (Universal Serial Bus) networking, and whenever --tty or
+ * -p is given.  The terminal itself draws the Japanese text.
+ */
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -6,11 +10,13 @@
 
 #include "ui.h"
 
-static volatile sig_atomic_t stop;
-static int color_ok;
+static volatile sig_atomic_t stop; /* set by Ctrl-C while a reply runs */
+static int color_ok;               /* stdout is a terminal, so colours work */
 
 static void on_int(int sig) { (void)sig; stop = 1; }
 
+/* Colour 0 plain, 1 cyan (user text), 2 dim (info), via ANSI (American
+ * National Standards Institute) terminal escape codes. */
 static void tty_write(const char *s, int color)
 {
 	static const char *const esc[] = {"", "\033[36m", "\033[2m"};
@@ -22,6 +28,10 @@ static void tty_write(const char *s, int color)
 	fflush(stdout);
 }
 
+/*
+ * Reads one line.  Ctrl-C quits at the prompt (default signal action) but
+ * only stops the current reply while the model is answering.
+ */
 static int tty_readline(char *buf, size_t max, int *kana)
 {
 	struct sigaction sa;
@@ -42,6 +52,7 @@ static int tty_readline(char *buf, size_t max, int *kana)
 static int tty_cancelled(void) { return stop; }
 static void tty_close(void) {}
 
+/* wants_kana = 0: type Japanese directly; echo_conversion = 1 for -k */
 static const ui_t tty_ui = {tty_write, tty_readline, tty_cancelled, tty_close, 0, 1};
 
 const ui_t *ui_tty_open(void)

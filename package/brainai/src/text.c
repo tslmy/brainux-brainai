@@ -1,4 +1,12 @@
-/* Romaji input, the calculator tool and the arithmetic helper ("IGC-lite"). */
+/*
+ * Text helpers:
+ *   - romaji_to_kana(): turns typed Latin letters ("konnnichiha") into
+ *     hiragana ("こんにちは");
+ *   - calc_eval() / format_number(): the calculator behind the `calc` tool;
+ *   - igc_find(): a stand-in for "IGC", the original app's exact-arithmetic
+ *     unit (the name is the upstream app's; it is not part of the published
+ *     weights).
+ */
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
@@ -7,6 +15,12 @@
 
 #include "brainai.h"
 
+/*
+ * Romaji -> hiragana pairs.  The list is searched from the top and the
+ * first prefix match wins, so longer spellings ("kya", "shi") come before
+ * shorter ones ("ka", "a").  "x" and "l" prefixes give the small kana
+ * (ぁ, ゃ, っ ...).
+ */
 static const char *const romaji[][2] = {
 	{"kya","きゃ"},{"kyu","きゅ"},{"kyo","きょ"},{"sha","しゃ"},{"shi","し"},{"shu","しゅ"},{"she","しぇ"},{"sho","しょ"},
 	{"sya","しゃ"},{"syu","しゅ"},{"syo","しょ"},{"cha","ちゃ"},{"chi","ち"},{"chu","ちゅ"},{"che","ちぇ"},{"cho","ちょ"},
@@ -41,7 +55,15 @@ static int put(char *out, size_t *o, size_t max, const char *s, size_t n)
 	return 0;
 }
 
-/* Converts ASCII romaji to hiragana; text inside [ ] and non-ASCII is kept. */
+/*
+ * Converts ASCII (American Standard Code for Information Interchange) romaji
+ * to hiragana; text inside [ ], digits, spaces and non-ASCII bytes are kept.
+ * Besides the table, three rules:
+ *   "nn"                    -> ん
+ *   "n" + not a vowel/"y"   -> ん   ("kanji" -> かんじ)
+ *   doubled consonant       -> っ   ("kitte" -> きって)
+ * Returns -1 if the output does not fit in max bytes.
+ */
 int romaji_to_kana(const char *in, char *out, size_t max)
 {
 	size_t o = 0, k;
@@ -115,7 +137,24 @@ static void normalize(const char *in, char *out, size_t max)
 	out[o] = 0;
 }
 
-typedef struct { const char *p; int deg, err; } calc_t;
+/*
+ * A recursive-descent parser: one function per precedence level, each
+ * calling the next tighter one.  The grammar, loosest first:
+ *
+ *   expr    = term  { ("+" | "-") term }
+ *   term    = power { ("*" | "/" | implicit) power }   implicit: "2pi", "3(4)"
+ *   power   = unary [ ("^" | "**") power ]             right-associative
+ *   unary   = ("-" | "+") unary | primary { "%" | "!" }
+ *   primary = number | "(" expr ")" | "pi" | "e" | function primary
+ *
+ * Numbers may use thousands separators ("1,234").  Functions: sqrt, sin,
+ * cos, tan, asin, acos, atan, log (base 10), ln, exp, abs.  With deg set,
+ * angles are in degrees, as the model expects.
+ */
+typedef struct {
+	const char *p; /* next character to read */
+	int deg, err;  /* degrees mode; set on a syntax error */
+} calc_t;
 
 static double c_expr(calc_t *c);
 
@@ -227,6 +266,7 @@ static double c_expr(calc_t *c)
 	}
 }
 
+/* Evaluates an expression; returns 0 on success, -1 on any error. */
 int calc_eval(const char *expr, double *result, int degrees)
 {
 	char buf[256], *e;
@@ -245,6 +285,11 @@ int calc_eval(const char *expr, double *result, int degrees)
 	return 0;
 }
 
+/*
+ * Formats a result the way a person would write it: whole numbers without
+ * a decimal point ("5535"), others with up to 10 significant digits and no
+ * trailing zeros ("0.25").
+ */
 void format_number(double v, char *buf, size_t max)
 {
 	if (fabs(v) < 1e15 && fabs(v - floor(v + 0.5)) < 1e-9 * (fabs(v) > 1 ? fabs(v) : 1)) {

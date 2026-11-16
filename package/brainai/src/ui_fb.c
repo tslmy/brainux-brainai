@@ -2,9 +2,21 @@
  * Framebuffer front end for the Brain's own screen and keyboard.
  *
  * The Linux text console cannot draw kanji, so brainai draws text itself
- * with a 16-px Unifont subset while the VT is in KD_GRAPHICS mode. Keyboard
- * input still arrives on the VT (raw termios). Romaji typed at the prompt is
- * shown already converted to hiragana; Ctrl-K toggles the conversion.
+ * with a 16-px Unifont subset while the VT (virtual terminal) is in
+ * KD_GRAPHICS mode. Keyboard input still arrives on the VT (raw termios,
+ * i.e. one byte per key press, no line editing or echo by the kernel).
+ * Romaji typed at the prompt is shown already converted to hiragana;
+ * Ctrl-K toggles the conversion.
+ *
+ * The framebuffer (/dev/fb0) is the screen's memory: mapped into this
+ * process with mmap(), writing a pixel value at (x, y) makes it appear.
+ * The screen is treated as a grid of 8 x 16-pixel cells; a kanji or kana
+ * glyph is two cells wide, an ASCII (American Standard Code for Information
+ * Interchange) letter one.
+ *
+ * font.bin (from tools/mkfont.py): "BRFN", u32 n, then n x (u32 code point,
+ * u32 width in pixels) sorted by code point, then n 32-byte bitmaps
+ * (16 rows x 16 bits, most significant bit = leftmost pixel).
  */
 #include <fcntl.h>
 #include <linux/fb.h>
@@ -27,23 +39,29 @@
 #define BRAINAI_DATADIR "/usr/share/brainai"
 #endif
 
-#define CW 8
-#define CH 16
+#define CW 8  /* cell width in pixels */
+#define CH 16 /* cell height in pixels */
 
+/* All framebuffer UI state. */
 static struct {
-	uint8_t *fb;
+	uint8_t *fb;                   /* mapped screen memory, visible page */
 	size_t fblen;
-	int xres, yres, bpp, stride;
-	struct fb_var_screeninfo var;
-	int cols, rows, cx, cy, scrolled;
-	uint32_t color[3], bg;
+	int xres, yres, bpp, stride;   /* pixels, bits per pixel, bytes per row */
+	struct fb_var_screeninfo var;  /* pixel format (colour bit positions) */
+	int cols, rows, cx, cy, scrolled; /* grid size, cursor cell, scroll count */
+	uint32_t color[3], bg;         /* text colours (see ui.h) and background */
 	/* font */
-	uint32_t nglyph, *cp, *gw;
-	const uint8_t *bits;
-	struct termios saved;
-	int vt_ok;
+	uint32_t nglyph, *cp, *gw;     /* glyph count, code points, widths */
+	const uint8_t *bits;           /* 32 bytes of bitmap per glyph */
+	struct termios saved;          /* terminal settings to restore on exit */
+	int vt_ok;                     /* the VT is in graphics mode */
 } F;
 
+/*
+ * Converts 0xRRGGBB into the screen's pixel format, e.g. RGB565 (5 bits red,
+ * 6 green, 5 blue) on a 16-bit screen: each channel keeps its top bits and
+ * moves to the position the driver reports.
+ */
 static uint32_t pack(uint32_t rgb)
 {
 	uint32_t r = (rgb >> 16) & 255, g = (rgb >> 8) & 255, b = rgb & 255;
@@ -70,6 +88,7 @@ static void fill(int x, int y, int w, int h, uint32_t c)
 	}
 }
 
+/* Index of the glyph for code point c (binary search), or -1. */
 static int glyph(uint32_t c)
 {
 	int lo = 0, hi = (int)F.nglyph - 1;
@@ -85,6 +104,7 @@ static int glyph(uint32_t c)
 	return -1;
 }
 
+/* Moves every text row up by one and clears the bottom row. */
 static void scroll(void)
 {
 	size_t line = (size_t)F.stride * CH;
@@ -102,6 +122,11 @@ static void newline(void)
 	}
 }
 
+/*
+ * Draws one character at the cursor and advances it, wrapping and
+ * scrolling as needed.  Missing CJK (Chinese, Japanese, Korean) glyphs show
+ * as □, other missing ones as '?'.
+ */
 static void putcp(uint32_t c, uint32_t fg)
 {
 	int g, w, x, y, x0, y0;
@@ -134,6 +159,12 @@ static void putcp(uint32_t c, uint32_t fg)
 	F.cx += w;
 }
 
+/*
+ * Decodes one UTF-8 (Unicode Transformation Format, 8-bit) character at s
+ * into *c and returns a pointer past it.  The lead byte's top bits give the
+ * length (0xxxxxxx: 1 byte, 110xxxxx: 2, 1110xxxx: 3, 11110xxx: 4); each
+ * following byte contributes 6 bits.
+ */
 static const char *utf8(const char *s, uint32_t *c)
 {
 	unsigned char b = (unsigned char)*s;
@@ -160,6 +191,10 @@ static void cursor(int on)
 		fill(F.cx * CW, F.cy * CH + CH - 2, CW, 2, on ? F.color[1] : F.bg);
 }
 
+/*
+ * Reads one key byte.  timeout_ms < 0 waits forever; otherwise returns -1
+ * if nothing arrives in time.  Returns -2 at end of input.
+ */
 static int readbyte(int timeout_ms)
 {
 	unsigned char b;
@@ -176,6 +211,12 @@ static int readbyte(int timeout_ms)
 	return b;
 }
 
+/*
+ * Redraws the input line from scratch after every key press: the prompt,
+ * then the typed text (converted to kana when enabled).  (sx, sy) is where
+ * the line starts; it moves up if drawing scrolled the screen.  last_rows
+ * remembers how many rows the previous drawing used, so they are cleared.
+ */
 static void render_input(int *sx, int *sy, int *last_rows, const char *raw, int kana)
 {
 	char disp[4096];
@@ -199,6 +240,11 @@ static void render_input(int *sx, int *sy, int *last_rows, const char *raw, int 
 	cursor(1);
 }
 
+/*
+ * Line editor for the Brain's keyboard: Enter submits, Backspace deletes a
+ * whole UTF-8 character, Ctrl-C clears the line, Ctrl-D on an empty line
+ * quits, Ctrl-K toggles kana, Ctrl-L clears the screen.
+ */
 static int fb_readline(char *buf, size_t max, int *kana)
 {
 	size_t n = 0;
@@ -252,6 +298,7 @@ static int fb_readline(char *buf, size_t max, int *kana)
 	}
 }
 
+/* Polled between tokens: true if Esc or Ctrl-C was pressed. */
 static int fb_cancelled(void)
 {
 	int c;
@@ -261,6 +308,10 @@ static int fb_cancelled(void)
 	return 0;
 }
 
+/*
+ * Puts the VT back into text mode with its old settings.  Called at exit and
+ * from fatal signals, so a crash never leaves the console unusable.
+ */
 static void restore(void)
 {
 	if (F.vt_ok) {
@@ -316,6 +367,11 @@ static int load_font(void)
 	return 0;
 }
 
+/*
+ * Starts the framebuffer UI.  Returns NULL (so main.c falls back to the
+ * terminal UI) unless stdin is a Linux VT, font.bin loads, and /dev/fb0 has
+ * 16 or 32 bits per pixel.
+ */
 const ui_t *ui_fb_open(void)
 {
 	struct fb_fix_screeninfo fix;
