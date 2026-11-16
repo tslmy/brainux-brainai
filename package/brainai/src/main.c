@@ -26,6 +26,7 @@ static int top_k = 40, max_new = 300, show_stats = 0;
 static uint32_t rng = 2463534242u;
 static unsigned char *digit_tok; /* 1: starts with a digit, 2: with '.' or ',' */
 static int recent[64], nrecent;
+static unsigned char *is_recent; /* V entries, set only inside sample() */
 
 static double now(void)
 {
@@ -48,16 +49,17 @@ static int sample(const float *lg, int mask_digits)
 	int k = top_k < 64 ? top_k : 64;
 	if (temperature <= 0)
 		k = 1;
+	if (!is_recent)
+		is_recent = calloc(V, 1);
+	for (j = 0; j < nrecent; j++)
+		is_recent[recent[j]] = 1;
 	for (i = 0; i < V; i++) {
 		float v = lg[i];
 		if (i == TOK_UNK || i == TOK_BOS || i == TOK_SYS || i == TOK_USER || i == TOK_BOT ||
 		    i == TOK_RESULT || (mask_digits && digit_tok[i]))
 			continue;
-		for (j = 0; j < nrecent; j++)
-			if (recent[j] == i) {
-				v = v > 0 ? v / rep_penalty : v * rep_penalty;
-				break;
-			}
+		if (is_recent[i])
+			v = v > 0 ? v / rep_penalty : v * rep_penalty;
 		if (n == k && v <= val[n - 1])
 			continue;
 		if (n < k)
@@ -69,6 +71,8 @@ static int sample(const float *lg, int mask_digits)
 		val[j] = v;
 		idx[j] = i;
 	}
+	for (j = 0; j < nrecent; j++)
+		is_recent[recent[j]] = 0;
 	if (n == 1 || temperature <= 0)
 		return idx[0];
 	mx = val[0];

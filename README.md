@@ -5,12 +5,33 @@ Runs [brain-ai v1 preview](https://huggingface.co/yamada2wasabi/brain-ai-v1-prev
 upstream app is a closed Windows CE binary, so `package/brainai/src` is a new
 inference engine written for the ARM926EJ-S (no FPU):
 
-- ternary projections use a 81-entry lookup table per group of four int8
-  activations (the trick smolmaxxing uses on small ARM cores);
-- the SSM recurrence is 32-bit fixed point; the tied LM head is int8 x int8;
+- ternary projections use an 81-entry lookup table per group of four int8
+  activations (T-MAC style, as smolmaxxing does on small ARM cores). Weights are
+  repacked at load time so each table block stays in the 16 KiB D-cache and
+  four rows share one table base;
+- everything element-wise inside a layer (conv, SiLU, SSM recurrence, gated
+  RMSNorm) is 32-bit fixed point with a sigmoid table, since soft float was
+  the biggest cost; the tied LM head is int8 x int8 on the DSP `SMLAxy`
+  instructions;
 - activations are int8-quantised per token, as in the model's training.
 
-Its greedy output matches a float reference implementation of the published weights.
+## Speed
+
+Measured on a PW-SH1 (i.MX283, ARM926EJ-S at 454 MHz, DRAM reads about
+170 MB/s) with `bench` (24 greedy steps, logits every step):
+
+| Version | ms/token | tok/s |
+|---|---|---|
+| first version (float element-wise, row-major LUT) | 331 | 3.0 |
+| repacked weights, cache-sized LUT blocks, DSP LM head (bit-exact) | 257 | 3.9 |
+| + fixed-point element-wise work, SMULWB in the SSM | 169 | 5.9 |
+
+Per token after these changes: ternary matvecs 68 ms, LM head 49 ms
+(9501 x 384 int8, 22 ms of it is just reading 3.6 MB), SSM 27 ms, conv 14 ms,
+the rest about 10 ms. Against the bit-exact build, the fixed-point build picks
+the same top token on 40 of 41 prompt positions (mean KL 0.002 nats).
+`make bench` in `src/` builds the benchmark; add `-DBRAINAI_PROF` to CFLAGS
+for the per-stage split.
 
 ## Build
 

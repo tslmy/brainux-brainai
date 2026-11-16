@@ -11,7 +11,11 @@ brainai: $(OBJS)
 %.o: %.c brainai.h ui.h
 	$(CC) $(CFLAGS) -DBRAINAI_DATADIR='"$(DATADIR)"' -c -o $@ $<
 
+# on-device benchmark (not installed); add -DBRAINAI_PROF for a per-stage split
+bench: bench.o engine.o
+	$(CC) $(LDFLAGS) -o $@ bench.o engine.o -lm
+
 clean:
-	rm -f brainai $(OBJS)
+	rm -f brainai bench bench.o $(OBJS)
 
 .PHONY: clean
