@@ -1,0 +1,12 @@
+config BR2_PACKAGE_BRAINAI
+	bool "brainai"
+	default y
+	select BR2_PACKAGE_BRAINAI_DATA
+	help
+	  Offline Japanese chat with the brain-ai v1 preview model
+	  (Mamba-2 + BitNet b1.58, 14.7M parameters). Integer-only
+	  ternary kernels for the ARM926 without FPU, a framebuffer UI
+	  with a built-in Japanese bitmap font and romaji input, plus a
+	  plain UTF-8 terminal mode for SSH.
+
+	  https://huggingface.co/yamada2wasabi/brain-ai-v1-preview

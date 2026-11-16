@@ -1,0 +1,5 @@
+# Locally computed
+sha256  d3a7217cc51f15a220832672428b4cba1b7600a67f8da12fbe61aca95289c0f5  model.safetensors
+sha256  e26024699904db04074d0236b98cceb3953b85f4c3b3c8c85fda39f5fe9ecc87  tokenizer.model
+sha256  7ead97a30114d5ed6d5adc4619cd215a9542b563c0ff77d7b6f0fcd12fd04f4e  config.json
+sha256  527925b9f03144a97e189c8715f5269b975b0340854287e3b7ac8f27cfd3bf9b  unifont_jp-17.0.04.bdf.gz
