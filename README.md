@@ -22,6 +22,9 @@ unchanged.
 
 ## Engine
 
+[docs/how-it-works.md](docs/how-it-works.md) walks through the engine and
+its optimisations with diagrams and formulas. In short:
+
 - Ternary projections use an 81-entry lookup table per group of four int8
   activations (T-MAC style, as [smolmaxxing](https://github.com/hyperionaidev/smolmaxxing)
   does on small ARM cores). Weights are repacked at load time so each table
