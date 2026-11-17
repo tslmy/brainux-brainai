@@ -5,8 +5,27 @@ config BR2_PACKAGE_BRAINAI
 	help
 	  Offline Japanese chat with the brain-ai v1 preview model
 	  (Mamba-2 + BitNet b1.58, 14.7M parameters). Integer-only
-	  ternary kernels for the ARM926 without FPU, a framebuffer UI
-	  with a built-in Japanese bitmap font and romaji input, plus a
-	  plain UTF-8 terminal mode for SSH.
+	  ternary kernels for the ARM926 without FPU, and a UTF-8
+	  terminal UI with live romaji-to-kana input.
 
 	  https://huggingface.co/yamada2wasabi/brain-ai-v1-preview
+
+config BR2_PACKAGE_BRAINAI_FBTERM
+	bool "Japanese on the Brain's own screen (fbterm)"
+	default y
+	depends on BR2_PACKAGE_BRAINAI
+	depends on BR2_USE_MMU && BR2_ENABLE_LOCALE && BR2_USE_WCHAR
+	# fbterm is written in C++, which Buildroot's own toolchain leaves
+	# off by default. An external toolchain must already provide it.
+	select BR2_TOOLCHAIN_BUILDROOT_CXX if BR2_TOOLCHAIN_BUILDROOT
+	select BR2_PACKAGE_FBTERM if BR2_INSTALL_LIBSTDCPP
+	select BR2_PACKAGE_WQY_ZENHEI
+	help
+	  The Linux text console cannot draw kanji. With this option,
+	  running brainai on the Brain's console restarts it inside
+	  fbterm, a framebuffer terminal that renders text with
+	  FreeType and the WenQuanYi Zen Hei CJK (Chinese, Japanese,
+	  Korean) font. Turns on C++ in Buildroot's toolchain.
+
+	  Without it, use brainai over SSH (Secure Shell), where your
+	  own terminal draws the Japanese text.

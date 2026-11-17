@@ -3,7 +3,7 @@ CC ?= cc
 CFLAGS ?= -O2
 CFLAGS += -Wall -Wextra -std=gnu99
 DATADIR ?= /usr/share/brainai
-OBJS = engine.o tokenizer.o text.o main.o ui_tty.o ui_fb.o
+OBJS = engine.o tokenizer.o text.o main.o ui_tty.o
 
 brainai: $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $(OBJS) -lm

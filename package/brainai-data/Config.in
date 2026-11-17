@@ -2,4 +2,4 @@ config BR2_PACKAGE_BRAINAI_DATA
 	bool
 	help
 	  brain-ai v1 preview weights (converted to brainai's packed
-	  ternary format) and a Unifont JP subset for the UI.
+	  ternary format) and the tokenizer vocabulary.

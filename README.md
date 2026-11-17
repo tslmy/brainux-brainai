@@ -16,9 +16,13 @@ unchanged.
   metadata (`BR2_EXTERNAL_BRAINAI_PATH`).
 - `package/brainai/`: the engine and app (`brainai`), built from `src/`.
 - `package/brainai-data/`: downloads the weights from a pinned Hugging Face
-  revision and GNU Unifont JP, then converts them with standard-library Python
-  (`src/tools/convert.py`, `src/tools/mkfont.py`) into `/usr/share/brainai/`
-  (`model.bin` 6.7 MB, `tok.bin`, `font.bin`).
+  revision, then converts them with standard-library Python
+  (`src/tools/convert.py`) into `/usr/share/brainai/` (`model.bin` 6.7 MB,
+  `tok.bin`).
+- `BR2_PACKAGE_BRAINAI_FBTERM` (on by default): Buildroot's own
+  [fbterm](https://code.google.com/archive/p/fbterm/) and WenQuanYi Zen Hei
+  font packages, so kanji show on the Brain's screen. fbterm is C++, so this
+  turns on C++ in Buildroot's toolchain.
 
 ## Engine
 
@@ -111,11 +115,12 @@ The image is written to `"$BRAINUX/image/sd_buildroot_brainai.img"`.
 ## Use
 
 - On the Brain's console, run `brainai`. The Linux console cannot draw kanji,
-  so brainai draws on `/dev/fb0` itself with a Unifont subset. Romaji typed at
-  the prompt appears as hiragana (`[ ]` keeps text as-is, Ctrl-K toggles), Esc
-  stops a reply and Ctrl-D quits.
-- Over SSH, `brainai` is a plain UTF-8 chat; type Japanese directly, or use
-  `-k` for romaji. `brainai -p "質問"` answers once.
+  so brainai restarts itself inside fbterm, a framebuffer terminal, with
+  romaji input on: romaji typed at the prompt appears as hiragana as you type
+  (`[ ]` keeps text as-is, Ctrl-K toggles). Esc stops a reply and Ctrl-D
+  quits. `--tty` skips fbterm.
+- Over SSH, `brainai` is the same chat in your own terminal; type Japanese
+  directly, or use `-k` for romaji. `brainai -p "質問"` answers once.
 - Tools the model calls: `calc` (local calculator, degrees), `time`, `memo`
   (`~/.brainai-memo.txt`), `search` (optional `/usr/share/brainai/search.tsv`
   with `keyword<TAB>text` lines; there is no bundled encyclopedia).
@@ -126,9 +131,8 @@ The image is written to `"$BRAINUX/image/sd_buildroot_brainai.img"`.
 
 ## Licence
 
-The code in this repository is MIT (`LICENSE`). The model (CC BY-SA 4.0) and
-Unifont (OFL-1.1, or GPL-2.0+ with the font embedding exception) are
-downloaded at build time and keep their own licences; see
-[THIRD-PARTY.md](THIRD-PARTY.md).
+The code in this repository is MIT (`LICENSE`). The model (CC BY-SA 4.0) is
+downloaded at build time and keeps its own licence; fbterm and the font come
+from Buildroot's packages under theirs. See [THIRD-PARTY.md](THIRD-PARTY.md).
 
 Parts of this code were written with AI assistance.

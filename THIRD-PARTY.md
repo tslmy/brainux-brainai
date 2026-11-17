@@ -18,11 +18,11 @@ that end up on the device image. Those files keep their own licences.
 The author's own brain-ai app for SHARP Brain's Windows CE system is a
 separate program. No code from it is used here.
 
-## GNU Unifont (Japanese)
+## fbterm and WenQuanYi Zen Hei
 
-- Source: <https://unifoundry.com/unifont/> (`unifont_jp-17.0.04.bdf.gz`,
-  downloaded from ftp.gnu.org)
-- Licence: SIL Open Font License 1.1, or GPL-2.0-or-later with the GNU font
-  embedding exception
-- On the image: `/usr/share/brainai/font.bin`, a subset produced by
-  `package/brainai/src/tools/mkfont.py`, distributed under the same licence.
+With `BR2_PACKAGE_BRAINAI_FBTERM`, the image also gets these unmodified
+Buildroot packages, which Buildroot downloads and records in its usual
+licence manifest (`make legal-info`):
+
+- fbterm 1.7.0, GPL-2.0-or-later
+- WenQuanYi Zen Hei 0.9.45, GPL-2.0 with the font embedding exception

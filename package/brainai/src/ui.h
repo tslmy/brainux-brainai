@@ -15,7 +15,7 @@ typedef struct {
 	int echo_conversion; /* print the converted kana after input */
 } ui_t;
 
-const ui_t *ui_tty_open(void);
-const ui_t *ui_fb_open(void); /* NULL when not on a framebuffer console */
+/* interactive: edit lines with live kana when stdin is a terminal */
+const ui_t *ui_tty_open(int interactive);
 
 #endif

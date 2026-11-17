@@ -3,8 +3,9 @@
  *
  * This file is the app around the engine:
  *   - parses the command line and loads the tokenizer and model;
- *   - picks a front end: the framebuffer UI (ui_fb.c) on the Brain's own
- *     screen, or the plain terminal UI (ui_tty.c) over SSH (Secure Shell);
+ *   - on the Brain's own screen, restarts itself inside fbterm, a
+ *     framebuffer terminal that can draw kanji (run_in_fbterm());
+ *   - talks to you through the terminal UI (ui_tty.c);
  *   - runs the chat loop: encode your message, feed it to the model, then
  *     sample the reply token by token (sample());
  *   - runs the tools the model calls (calc, time, memo, search);
@@ -15,11 +16,13 @@
  *   reply may contain  <call> tool: argument <end>  after which the app
  *   feeds  <result> tool output <end> <bot>  and the model continues.
  */
+#include <linux/kd.h>
 #include <math.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -441,6 +444,42 @@ static void help(void)
 		 "[ ]で囲んだ部分はかなに変換されません (例: [123*45]wa?)\n", 2);
 }
 
+/*
+ * The Linux text console can only draw a few hundred glyphs, so no kanji.
+ * When brainai is started on it (stdin is a VT, a virtual terminal, which
+ * answers the KDGETMODE ioctl), it runs itself again inside fbterm, which
+ * draws text on the framebuffer with a CJK (Chinese, Japanese, Korean)
+ * font, and turns romaji input on (-k), since the Brain's keyboard has no
+ * Japanese input method.  Inside fbterm, stdin is a pseudo-terminal, which
+ * does not answer KDGETMODE, so this happens only once.  Returns only if
+ * fbterm cannot be started; brainai then carries on without kanji.
+ */
+static void run_in_fbterm(int argc, char **argv)
+{
+	char *av[64], self[256];
+	int mode, i, n = 0;
+	ssize_t len;
+
+	if (ioctl(0, KDGETMODE, &mode) < 0 || argc > 60)
+		return;
+	len = readlink("/proc/self/exe", self, sizeof(self) - 1);
+	if (len <= 0)
+		return;
+	self[len] = 0;
+	av[n++] = "fbterm";
+	av[n++] = "--font-names=WenQuanYi Zen Hei Mono";
+	av[n++] = "--font-size=16";
+	av[n++] = "--";
+	av[n++] = self;
+	av[n++] = "-k";
+	for (i = 1; i < argc; i++)
+		av[n++] = argv[i];
+	av[n] = NULL;
+	execvp(av[0], av);
+	fprintf(stderr, "brainai: fbterm not found, Japanese text will not show here\n");
+	sleep(2);
+}
+
 int main(int argc, char **argv)
 {
 	const char *dir = BRAINAI_DATADIR, *prompt = NULL;
@@ -463,10 +502,13 @@ int main(int argc, char **argv)
 				"               [-r repetition_penalty] [-k] [--tty] [--stats]\n"
 				"  -p    answer one prompt and exit\n"
 				"  -k    convert romaji input to hiragana\n"
-				"  --tty plain UTF-8 terminal even on the framebuffer console\n");
+				"  --tty do not start fbterm on the Brain's console\n");
 			return 2;
 		}
 	}
+	if (!prompt && !force_tty)
+		run_in_fbterm(argc, argv);
+
 	/* no -s given: seed from the time and process id */
 	if (rng == 2463534242u)
 		rng ^= (uint32_t)time(NULL) ^ ((uint32_t)getpid() << 16);
@@ -493,10 +535,8 @@ int main(int argc, char **argv)
 			       n > 0 && (b[0] == '.' || b[0] == ',') ? 2 : 0;
 	}
 
-	/* the framebuffer UI only on the Brain's own console, and not with -p */
-	U = (!prompt && !force_tty) ? ui_fb_open() : NULL;
-	if (!U)
-		U = ui_tty_open();
+	/* line editing with live kana, except for one-shot -p answers */
+	U = ui_tty_open(!prompt);
 	if (kana < 0)
 		kana = U->wants_kana;
 

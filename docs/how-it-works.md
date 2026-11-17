@@ -209,9 +209,7 @@ scale $s_v = \max_i |e_{v,i}| / 127$, and each value is stored as
 $\mathrm{round}(e_{v,i} / s_v)$, an int8.
 
 The tokenizer file (`tokenizer.model`, a protobuf, Google's binary
-serialisation format) is parsed by hand into `tok.bin`, and a second script,
-`tools/mkfont.py`, cuts GNU Unifont down to the characters the model can
-print.
+serialisation format) is parsed by hand into `tok.bin`.
 
 ## 4. Ternary weights: multiplying without multiplying
 
@@ -598,11 +596,14 @@ The engine is about a quarter of the code. The rest makes it usable:
   the Viterbi algorithm (dynamic programming over byte positions), and falls
   back to raw UTF-8 (Unicode Transformation Format, 8-bit) bytes for
   characters not in the vocabulary.
-- **Screen** (`ui_fb.c`). The Linux text console cannot draw kanji, so the
-  app switches the VT (virtual terminal) into graphics mode and draws 16-pixel
-  Unifont glyphs straight into the framebuffer.
-- **Input** (`text.c`). Romaji typed at the prompt is converted to hiragana as
-  you type; text in `[ ]` is left alone.
+- **Screen** (`main.c`). The Linux text console cannot draw kanji. Started
+  on it, brainai runs itself again inside
+  [fbterm](https://code.google.com/archive/p/fbterm/), a framebuffer terminal
+  that draws text with FreeType and the WenQuanYi Zen Hei font. Both are
+  ready-made Buildroot packages.
+- **Input** (`ui_tty.c`, `text.c`). The app edits the input line itself, so
+  romaji typed at the prompt is shown converted to hiragana as you type; text
+  in `[ ]` is left alone.
 - **Tools** (`main.c`). The model was trained to call tools by emitting a
   special token, a call such as `calc: 123*45`, and an end token. The app runs
   `calc`, `time`, `memo` and `search`, then feeds the result back in.
@@ -611,7 +612,8 @@ The engine is about a quarter of the code. The rest makes it usable:
   finds an arithmetic expression in your message, computes it exactly, and
   when the model starts writing digits after "は" or "=", it inserts the
   exact number instead. So `123*45は？` really answers 5535.
-- **Over SSH (Secure Shell)**, `ui_tty.c` provides a plain UTF-8 chat.
+- **Over SSH (Secure Shell)**, the same terminal UI runs in your own
+  terminal.
 
 ## 11. Results and what is left
 
