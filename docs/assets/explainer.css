@@ -1,0 +1,169 @@
+/*
+ * Styles for the interactive figures, symbol tooltips and maths of the
+ * brainux-brainai explainer. Scoped to .brainai-explainer so the file can be
+ * dropped into the author's blog next to its own stylesheet. Uses the blog's
+ * colour tokens (--text, --muted, --bg, --accent) and adds a few of its own.
+ */
+.brainai-explainer {
+  --bx-rule: color-mix(in srgb, var(--muted, #666) 35%, transparent);
+  --bx-panel: color-mix(in srgb, var(--text, #1a1a1a) 4%, var(--bg, #fffff8));
+  --bx-pos: #2f6db3;
+  --bx-neg: #c0462b;
+  --bx-hl: #e6a817;
+  --bx-ok: #2e7d4f;
+  --bx-mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  --bx-sans: system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  .brainai-explainer { --bx-pos: #7fb0ea; --bx-neg: #f08c73; --bx-hl: #f2c14e; --bx-ok: #6fc28f; }
+}
+
+/* Wide blocks spill from the text column into the margin, like the blog's images. */
+.brainai-explainer .wide { width: calc(100% / 0.6); clear: right; }
+@media (max-width: 900px) { .brainai-explainer .wide { width: 100%; } }
+.brainai-explainer div.wide { overflow-x: auto; }
+.brainai-explainer table { border-collapse: collapse; font-size: .95rem; margin: 1rem 0; }
+.brainai-explainer th, .brainai-explainer td { text-align: left; padding: .3rem .8rem .3rem 0; border-bottom: 1px solid var(--bx-rule); vertical-align: top; }
+.brainai-explainer pre { font: .8rem/1.35 var(--bx-mono); overflow-x: auto; padding: .6rem 0; margin: 1.2rem 0; }
+.brainai-explainer code { font-family: var(--bx-mono); font-size: .88em; }
+.brainai-explainer h2 { clear: both; margin-top: 2.6rem; line-height: 1.25; }
+.brainai-explainer h3 { margin-top: 2rem; }
+.brainai-explainer .lede { font-size: 1.2rem; color: var(--muted); }
+.brainai-explainer .reading-guide { font: .9rem/1.5 var(--bx-sans); color: var(--muted); border-left: 3px solid var(--bx-hl); padding: .3rem .8rem; }
+.brainai-explainer .toc ol { padding-left: 1.4rem; }
+.brainai-explainer .toc h2 { margin-top: 1.5rem; font-size: 1.1rem; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.brainai-explainer .colophon { font-size: .9rem; color: var(--muted); }
+
+/* Maths */
+.brainai-explainer math { font-size: 1.08em; }
+.brainai-explainer .katex-display { display: block; margin: 1.1rem 0; overflow-x: auto; overflow-y: hidden; padding: .2rem 0; }
+.brainai-explainer .katex-display > .katex { display: block; }
+.brainai-explainer math[display="block"] { font-size: 1.12em; }
+.brainai-explainer .bx-nowrap { white-space: nowrap; }
+/* MathML Core ignores columnalign; KaTeX's aligned columns alternate right/left. */
+.brainai-explainer mtable mtd:nth-child(odd) { text-align: right; }
+.brainai-explainer mtable mtd:nth-child(even) { text-align: left; }
+
+/* Clickable symbols */
+.brainai-explainer .sym { cursor: help; border-radius: 3px; outline: none; }
+.brainai-explainer var.sym { font-style: italic; font-family: inherit; }
+.brainai-explainer .sym:hover, .brainai-explainer .sym:focus-visible, .brainai-explainer .sym.is-open {
+  background: color-mix(in srgb, var(--bx-hl) 35%, transparent);
+}
+.brainai-explainer .sym:focus-visible { box-shadow: 0 0 0 2px var(--bx-hl); }
+.bx-tip {
+  position: absolute; z-index: 50; max-width: min(22rem, calc(100vw - 16px));
+  padding: .5rem .7rem; border-radius: 6px;
+  background: var(--text, #1a1a1a); color: var(--bg, #fffff8);
+  font: .85rem/1.45 system-ui, -apple-system, 'Segoe UI', sans-serif;
+  box-shadow: 0 4px 16px rgb(0 0 0 / .25); pointer-events: none;
+}
+.bx-tip[hidden] { display: none; }
+.bx-tip b { font-weight: 600; }
+.bx-tip code { font-size: .9em; }
+
+/* Figures */
+.brainai-explainer figure.widget {
+  margin: 1.8rem 0; padding: 1rem 1.1rem 1.1rem; border: 1px solid var(--bx-rule); border-radius: 8px;
+  background: var(--bx-panel); font: .92rem/1.5 var(--bx-sans);
+}
+.brainai-explainer figure.widget figcaption { margin-bottom: .8rem; color: var(--muted); }
+.brainai-explainer figure.widget figcaption strong { color: var(--text); }
+.brainai-explainer figure.widget pre { font-size: .75rem; }
+.bx-row { display: flex; flex-wrap: wrap; gap: .5rem 1rem; align-items: center; margin: .5rem 0; }
+.bx-label { color: var(--muted); min-width: 7.5rem; }
+.bx-mono { font-family: var(--bx-mono); font-size: .88em; }
+.bx-out { font-family: var(--bx-mono); font-size: .86rem; line-height: 1.6; margin: .6rem 0 0; overflow-x: auto; }
+.bx-out .ok { color: var(--bx-ok); }
+.bx-out .bad { color: var(--bx-neg); }
+.bx-note { color: var(--muted); font-size: .85rem; margin: .5rem 0 0; }
+.brainai-explainer figure.widget input[type=number], .brainai-explainer figure.widget input[type=text] {
+  width: 5.2rem; font: inherit; font-family: var(--bx-mono); padding: .2rem .35rem; border: 1px solid var(--bx-rule);
+  border-radius: 4px; background: var(--bg); color: var(--text);
+}
+.brainai-explainer figure.widget input[type=range] { width: 11rem; max-width: 100%; accent-color: var(--accent); }
+.brainai-explainer figure.widget button {
+  font: inherit; padding: .25rem .65rem; border: 1px solid var(--bx-rule); border-radius: 5px;
+  background: var(--bg); color: var(--text); cursor: pointer; min-height: 2rem;
+}
+.brainai-explainer figure.widget button:hover { border-color: var(--accent); }
+.brainai-explainer figure.widget button[aria-pressed=true] { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+.bx-slider { display: inline-flex; align-items: center; gap: .4rem; }
+.bx-slider output { font-family: var(--bx-mono); font-size: .85rem; min-width: 4.5rem; }
+.bx-svg { width: 100%; height: auto; display: block; touch-action: none; user-select: none; -webkit-user-select: none; }
+.bx-svg text { font: 11px var(--bx-sans); fill: var(--muted); }
+.bx-svg .axis { stroke: var(--bx-rule); }
+
+/* LUT */
+.bx-weights button { min-width: 3.2rem; font-family: var(--bx-mono); }
+.bx-weights .w-1 { color: var(--bx-neg); }
+.bx-weights .w1 { color: var(--bx-pos); }
+.bx-weightcol { display: inline-flex; flex-direction: column; align-items: center; gap: .1rem; }
+.bx-weightcol small { color: var(--muted); font-family: var(--bx-mono); }
+.bx-lut-wrap { overflow-x: auto; margin-top: .6rem; }
+table.bx-lut { border-collapse: separate; border-spacing: 2px; margin: 0; font: .78rem/1 var(--bx-mono); }
+table.bx-lut td, table.bx-lut th { border: 0; padding: 0; text-align: center; vertical-align: middle; }
+table.bx-lut td { width: 2.6rem; height: 2.3rem; border-radius: 3px; cursor: pointer; position: relative; }
+table.bx-lut td small { position: absolute; top: 1px; left: 3px; font-size: .55rem; opacity: .6; }
+table.bx-lut td.sel { outline: 3px solid var(--bx-hl); outline-offset: -1px; font-weight: 700; }
+table.bx-lut th { color: var(--muted); font-weight: 400; padding: 0 .25rem; background: color-mix(in srgb, var(--muted) 12%, transparent); border-radius: 3px; height: 2.3rem; }
+table.bx-lut th.hl { background: color-mix(in srgb, var(--bx-hl) 40%, transparent); color: var(--text); }
+table.bx-lut th small { display: block; font-size: .55rem; margin-top: .15rem; }
+table.bx-lut th.corner { background: none; font-size: .6rem; line-height: 1.2; }
+
+/* Repack */
+.bx-matrix { display: grid; gap: 2px; margin: .4rem 0; font: .68rem/1 var(--bx-mono); }
+.bx-matrix .cell { aspect-ratio: 2.2; display: flex; align-items: center; justify-content: center; border-radius: 2px; background: color-mix(in srgb, var(--muted) 14%, transparent); transition: background .15s; }
+.bx-matrix .cell.done { background: color-mix(in srgb, var(--bx-pos) 22%, transparent); }
+.bx-matrix .cell.now { background: var(--bx-hl); color: #000; font-weight: 700; }
+.bx-matrix .hdr { color: var(--muted); display: flex; align-items: center; justify-content: center; font-size: .62rem; }
+.bx-matrix .tbl { border-radius: 2px; text-align: center; font-size: .58rem; padding: .15rem 0; color: var(--muted); border: 1px dashed var(--bx-rule); }
+.bx-matrix .tbl.live { border: 1px solid var(--bx-pos); color: var(--text); background: color-mix(in srgb, var(--bx-pos) 15%, transparent); }
+.bx-matrix .tbl.now { background: var(--bx-hl); color: #000; border-color: var(--bx-hl); }
+.bx-matrix .blk-start { margin-left: 5px; }
+.bx-matrix .quad-start { margin-top: 4px; }
+.bx-strip { display: flex; flex-wrap: wrap; gap: 3px; margin: .4rem 0; }
+.bx-strip .word { display: flex; border: 1px solid var(--bx-rule); border-radius: 2px; }
+.bx-strip .word span, .bx-strip .byte { width: .8rem; height: .9rem; background: color-mix(in srgb, var(--muted) 14%, transparent); }
+.bx-strip .word span + span { border-left: 1px solid var(--bx-rule); }
+.bx-strip .byte { border: 1px solid var(--bx-rule); border-radius: 2px; }
+.bx-strip .done span, .bx-strip .byte.done { background: color-mix(in srgb, var(--bx-pos) 25%, transparent); }
+.bx-strip .now span, .bx-strip .byte.now { background: var(--bx-hl); }
+.bx-strip .word.now { border-color: var(--bx-hl); }
+.bx-meter { position: relative; height: 1.2rem; border-radius: 3px; background: color-mix(in srgb, var(--muted) 14%, transparent); overflow: hidden; flex: 1 1 12rem; min-width: 10rem; }
+.bx-meter > div { position: absolute; inset: 0 auto 0 0; background: var(--bx-pos); }
+.bx-meter > div.over { background: var(--bx-neg); }
+.bx-meter span { position: absolute; left: .3rem; top: .15rem; font: .7rem/.9rem var(--bx-mono); color: var(--text); background: var(--bg); padding: 0 .3rem; border-radius: 2px; }
+.bx-meter { height: 1.25rem; }
+
+/* Bits */
+.bx-bits { display: flex; gap: 1px; font: .66rem/1 var(--bx-mono); margin: .15rem 0; min-width: max-content; }
+.bx-bits span { width: .95rem; height: 1.25rem; display: flex; align-items: center; justify-content: center; border-radius: 2px; background: color-mix(in srgb, var(--muted) 12%, transparent); }
+.bx-bits span.one { background: color-mix(in srgb, var(--bx-pos) 40%, transparent); color: var(--text); }
+.bx-bits span.frac { box-shadow: inset 0 -3px 0 color-mix(in srgb, var(--bx-hl) 80%, transparent); }
+.bx-bits span.sign { box-shadow: inset 0 -3px 0 var(--bx-neg); }
+.bx-bits span.idx { background: color-mix(in srgb, var(--bx-pos) 18%, transparent); }
+.bx-bits span.off { opacity: .3; }
+.bx-bits span.point { width: .35rem; background: none; color: var(--accent); font-weight: 700; }
+.bx-bits span.gap { width: .45rem; background: none; }
+.bx-bits span.pad { background: none; }
+.bx-bits span.drop { opacity: .35; }
+.bx-bitrow { display: flex; align-items: center; gap: .6rem; overflow-x: auto; }
+.bx-bitrow > b { font-weight: 400; color: var(--muted); min-width: 6.5rem; font-size: .8rem; }
+.bx-legend { display: flex; flex-wrap: wrap; gap: .3rem 1rem; font-size: .8rem; color: var(--muted); margin: .4rem 0; }
+.bx-legend i { display: inline-block; width: .8rem; height: .8rem; vertical-align: -2px; margin-right: .3rem; border-radius: 2px; }
+
+@media (max-width: 600px) {
+  .brainai-explainer figure.widget { padding: .8rem .7rem; margin-left: -.3rem; margin-right: -.3rem; }
+  .bx-label { min-width: 0; width: 100%; }
+  .bx-matrix .cell { aspect-ratio: 1.1; }
+  .bx-svg text { font-size: 18px; }
+  table.bx-lut td { width: 2.05rem; height: 2rem; }
+  table.bx-lut { font-size: .68rem; }
+  /* bits: colour only, every row exactly as wide as the figure, so columns line up */
+  .bx-bitrow { flex-direction: column; align-items: stretch; gap: .1rem; overflow: visible; margin-bottom: .3rem; }
+  .bx-bitrow > b { min-width: 0; font-size: .72rem; }
+  .bx-bits { min-width: 0; width: 100%; }
+  .bx-bits span { width: auto; flex: 1 1 0; min-width: 0; font-size: 0; height: .95rem; }
+  .bx-bits span.point { flex: 0 0 .35rem; font-size: .7rem; }
+}

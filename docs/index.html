@@ -1,0 +1,583 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Running a language model on an electronic dictionary</title>
+    <meta name="description" content="How brainux-brainai runs brain-ai, a 14.7-million-parameter Japanese language model, on a SHARP Brain electronic dictionary at 6 tokens per second." />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="stylesheet" href="assets/site.css" />
+    <link rel="stylesheet" href="assets/explainer.css" />
+  </head>
+  <body>
+    <header class="site"><a href="https://github.com/tslmy/brainux-brainai">brainux-brainai</a></header>
+    <article>
+      <h1>Running a language model on an electronic dictionary</h1>
+      <time datetime="2026-11-17">2026-11-17</time>
+      <div class="prose brainai-explainer">
+<p class="lede"><em>How brainux-brainai runs brain-ai, a 14.7-million-parameter Japanese language model, on a SHARP Brain electronic dictionary at 6 tokens per second.</em></p>
+
+<p class="reading-guide">Every symbol in the maths is clickable: hover over it, tap it, or focus it with the keyboard to see what it stands for. The boxed figures are live. Drag, click and type in them.</p>
+
+<p>SHARP Brain is a line of Japanese electronic dictionaries. Under the hood, they are small ARM computers, and the <a href="https://github.com/brain-hackers/buildbrain">Brainux</a> project runs Linux on them. In late 2026, the developer yamada2wasabi released <a href="https://huggingface.co/yamada2wasabi/brain-ai-v1-preview">brain-ai</a>, a tiny Japanese chat model designed for exactly this kind of device, together with an app for the Brain's stock <a href="https://en.wikipedia.org/wiki/Windows_Embedded_Compact">Windows CE</a> (Compact Edition) system. That app is closed source and does not run on Linux.</p>
+
+<p>This article describes the engine we wrote to run the same model on Brainux: first how it works at all, then how we made it twice as fast. Every number below was measured on a PW-SA3.<span class="sidenote-wrap"><label for="sn-1" class="sidenote-number"></label><input type="checkbox" id="sn-1" class="sidenote-toggle"><span class="sidenote">A plain-Markdown version of this article lives in the repository as <a href="https://github.com/tslmy/brainux-brainai/blob/main/docs/how-it-works.md"><code>docs/how-it-works.md</code></a>. The engine's source comments point to its section numbers, which this page keeps.</span></span></p>
+
+<nav class="toc" aria-label="Contents">
+<h2 id="contents">Contents</h2>
+<ol>
+<li><a href="#1-the-hardware">The hardware</a></li>
+<li><a href="#2-the-model">The model</a></li>
+<li><a href="#3-getting-the-model-onto-the-device">Getting the model onto the device</a></li>
+<li><a href="#4-ternary-weights-multiplying-without-multiplying">Ternary weights: multiplying without multiplying</a></li>
+<li><a href="#5-measure-first">Measure first</a></li>
+<li><a href="#6-rearranging-the-weights-for-the-cache">Rearranging the weights for the cache</a></li>
+<li><a href="#7-scoring-the-vocabulary-with-dsp-instructions">Scoring the vocabulary with DSP (digital signal processing) instructions</a></li>
+<li><a href="#8-replacing-floating-point-with-integers">Replacing floating point with integers</a></li>
+<li><a href="#9-did-it-change-the-answers">Did it change the answers?</a></li>
+<li><a href="#10-the-app-around-the-engine">The app around the engine</a></li>
+<li><a href="#11-results-and-what-is-left">Results and what is left</a></li>
+</ol>
+</nav>
+
+<section data-sec="1">
+<h2 id="1-the-hardware">1. The hardware</h2>
+
+<p>The PW-SA3 is built around an NXP i.MX283 <a href="https://en.wikipedia.org/wiki/System_on_a_chip">SoC</a> (system on a chip):</p>
+
+<div class="wide"><table>
+<thead><tr><th>Part</th><th>What it means for us</th></tr></thead>
+<tbody>
+<tr><td><a href="https://en.wikipedia.org/wiki/ARM9">ARM926EJ-S</a> core, 454 MHz, ARMv5TE instruction set</td><td>One instruction at a time, no out-of-order execution</td></tr>
+<tr><td>No <a href="https://en.wikipedia.org/wiki/Floating-point_unit">FPU</a> (floating-point unit)</td><td>Every <code>float</code> operation is emulated in software, costing tens of instructions</td></tr>
+<tr><td>No <a href="https://en.wikipedia.org/wiki/Single_instruction,_multiple_data">SIMD</a> (single instruction, multiple data) unit, no NEON</td><td>No vector maths; one number at a time</td></tr>
+<tr><td>A few <a href="https://en.wikipedia.org/wiki/Digital_signal_processor">DSP</a> instructions</td><td>16-bit × 16-bit and 32-bit × 16-bit multiplies in a single instruction</td></tr>
+<tr><td>16 KiB data <a href="https://en.wikipedia.org/wiki/CPU_cache">cache</a>, blocking</td><td>A cache miss stalls the whole CPU (central processing unit) until memory answers</td></tr>
+<tr><td>128 MB of RAM (random-access memory), 115 MB visible to Linux</td><td>Plenty for a 6.7 MB model, but slow</td></tr>
+</tbody>
+</table></div>
+
+<p>We measured memory bandwidth with a small read loop:</p>
+
+<pre class="diagram">
+  data size     read speed
+  ─────────     ──────────
+     8 KiB      518 MB/s   ← fits in the 16 KiB cache
+    64 KiB      192 MB/s   ← spills out of the cache
+   DRAM         168 MB/s   ← DRAM (dynamic RAM), i.e. main memory
+</pre>
+
+<p>Two lessons fall out of this table, and they drive every optimisation later:</p>
+
+<ul>
+<li><strong>Avoid <code>float</code>.</strong> Without an FPU, a single <code>a * b</code> on floats is a function call.<span class="sidenote-wrap"><label for="sn-2" class="sidenote-number"></label><input type="checkbox" id="sn-2" class="sidenote-toggle"><span class="sidenote">The compiler turns it into a call to a library routine (<code>__aeabi_fmul</code>) that unpacks both numbers' signs, exponents and mantissas, multiplies the mantissas with integer instructions, then rounds and repacks the result.</span></span></li>
+<li><strong>Keep the working set under 16 KiB.</strong> Anything that does not fit is read at a third of the speed.</li>
+</ul>
+</section>
+
+<section data-sec="2">
+<h2 id="2-the-model">2. The model</h2>
+
+<p>brain-ai v1 preview combines two ideas.</p>
+
+<p><strong><a href="https://huggingface.co/docs/transformers/en/model_doc/mamba2">Mamba-2</a> instead of a <a href="https://en.wikipedia.org/wiki/Transformer_(deep_learning_architecture)">Transformer</a>.</strong> A Transformer looks back at every previous token at each step, so its memory and time grow with the conversation. Mamba-2 is an <a href="https://www.ibm.com/think/topics/state-space-model">SSM</a> (state space model): each layer keeps a fixed-size <em>state</em> and updates it once per token. The cost per token is constant, which is exactly what a small device wants.</p>
+
+<p><strong><a href="https://en.wikipedia.org/wiki/1.58-bit_large_language_model">BitNet b1.58</a> weights.</strong> In the big matrices, every weight is −1, 0 or +1, times one scale per matrix.<span class="sidenote-wrap"><label for="sn-3" class="sidenote-number"></label><input type="checkbox" id="sn-3" class="sidenote-toggle"><span class="sidenote">Three possible values carry <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mrow><mi>log</mi><mo>⁡</mo></mrow><mn>2</mn></msub><mn>3</mn><mo>≈</mo><mn>1.58</mn></mrow><annotation encoding="application/x-tex">\log_2 3 \approx 1.58</annotation></semantics></math></span> bits of information, hence the name.</span></span> The inputs to those matrices are rounded to 8-bit integers (int8) per token. A matrix–vector product therefore needs only additions and subtractions of small integers.</p>
+
+<p>The sizes:</p>
+
+<div class="wide"><table>
+<thead><tr><th>Symbol</th><th>Value</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>V</mi></mrow><annotation encoding="application/x-tex">V</annotation></semantics></math></span></td><td>9,501</td><td>vocabulary size (tokens)</td></tr>
+<tr><td><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>D</mi></mrow><annotation encoding="application/x-tex">D</annotation></semantics></math></span></td><td>384</td><td>width of the vector passed between layers</td></tr>
+<tr><td><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>L</mi></mrow><annotation encoding="application/x-tex">L</annotation></semantics></math></span></td><td>12</td><td>layers</td></tr>
+<tr><td><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>E</mi></mrow><annotation encoding="application/x-tex">E</annotation></semantics></math></span></td><td>768</td><td>inner width of each layer <span class="bx-nowrap">(<span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mi>D</mi></mrow><annotation encoding="application/x-tex">2D</annotation></semantics></math></span>)</span></td></tr>
+<tr><td><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>H</mi><mo>×</mo><mi>P</mi></mrow><annotation encoding="application/x-tex">H \times P</annotation></semantics></math></span></td><td>16 × 48</td><td>16 heads of 48 channels <span class="bx-nowrap">(<span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>=</mo><mi>E</mi></mrow><annotation encoding="application/x-tex">= E</annotation></semantics></math></span>)</span></td></tr>
+<tr><td><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi></mrow><annotation encoding="application/x-tex">N</annotation></semantics></math></span></td><td>32</td><td>state size per channel</td></tr>
+<tr><td><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi></mrow><annotation encoding="application/x-tex">K</annotation></semantics></math></span></td><td>4</td><td>convolution width (tokens)</td></tr>
+</tbody>
+</table></div>
+
+<p>Two terms appear in the diagram below. <a href="https://en.wikipedia.org/wiki/Swish_function">SiLU</a> (sigmoid linear unit) is the activation function <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="normal">SiLU</mi><mo>⁡</mo><mo stretchy="false">(</mo><mi>x</mi><mo stretchy="false">)</mo><mo>=</mo><mi>x</mi><mo>⋅</mo><mi>σ</mi><mo stretchy="false">(</mo><mi>x</mi><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">\operatorname{SiLU}(x) = x \cdot \sigma(x)</annotation></semantics></math></span>,</span> where <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>σ</mi><mo stretchy="false">(</mo><mi>x</mi><mo stretchy="false">)</mo><mo>=</mo><mn>1</mn><mi mathvariant="normal">/</mi><mo stretchy="false">(</mo><mn>1</mn><mo>+</mo><msup><mi>e</mi><mrow><mo>−</mo><mi>x</mi></mrow></msup><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">\sigma(x) = 1 / (1 + e^{-x})</annotation></semantics></math></span> is the <a href="https://en.wikipedia.org/wiki/Sigmoid_function">sigmoid</a>.<span class="sidenote-wrap"><label for="sn-4" class="sidenote-number"></label><input type="checkbox" id="sn-4" class="sidenote-toggle"><span class="sidenote">An activation function bends a layer's output so that stacked layers can model more than a straight line. SiLU lets positive values through almost unchanged and squashes negative ones towards zero, smoothly.</span></span> The LM (language model) head is the last step, which scores every vocabulary word; it reuses the <a href="https://en.wikipedia.org/wiki/Word_embedding">embedding</a> table, which is why the model is called “tied”.<span class="sidenote-wrap"><label for="sn-5" class="sidenote-number"></label><input type="checkbox" id="sn-5" class="sidenote-toggle"><span class="sidenote">Sharing the input and output tables is known as <a href="https://arxiv.org/abs/1608.05859">weight tying</a> (Press and Wolf, 2016). Here it saves 3.65 MB, more than half the model file.</span></span></p>
+
+<p>One step, for one token, looks like this:</p>
+
+<pre class="diagram wide">
+ token id
+    │
+    ▼
+ ┌────────────────────┐
+ │ embedding lookup   │  row `token` of a 9,501 × 384 table
+ └─────────┬──────────┘
+           │ x  (384 numbers)
+           ▼
+ ╔═══════════════════════════════════════════════════════════╗
+ ║  layer 1 … 12                                             ║
+ ║                                                           ║
+ ║   x ──► normalise ──► round to int8 ──► ternary matrix    ║
+ ║                                         384 → 1,616       ║
+ ║            ┌──────────────┬───────────┬────────┬──────┐   ║
+ ║            ▼              ▼           ▼        ▼      ▼   ║
+ ║          gate z      signal x'       B        C     step  ║
+ ║          (768)        (768)        (32)     (32)  dt (16) ║
+ ║            │              └─────┬─────┴────────┘      │   ║
+ ║            │                    ▼                     │   ║
+ ║            │        4-token convolution + SiLU        │   ║
+ ║            │                    │                     │   ║
+ ║            │                    ▼                     │   ║
+ ║            │         SSM state update  ◄──────────────┘   ║
+ ║            │         (16 × 48 × 32 numbers kept)          ║
+ ║            │                    │ y (768)                 ║
+ ║            └──────► y · SiLU(z), normalise, round to int8 ║
+ ║                                 │                         ║
+ ║                                 ▼                         ║
+ ║                     ternary matrix 768 → 384              ║
+ ║                                 │                         ║
+ ║   x  ◄──────────── x + result ──┘                         ║
+ ╚═══════════════════════════════════════════════════════════╝
+           │
+           ▼
+ ┌────────────────────┐
+ │ normalise, score   │  dot product with all 9,501 rows of
+ │ every vocabulary   │  the same embedding table
+ │ word ("LM head")   │
+ └─────────┬──────────┘
+           ▼
+   9,501 scores ("logits") → pick the next token
+</pre>
+
+<p>The heart of the layer is the SSM state update. For each head <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>h</mi></mrow><annotation encoding="application/x-tex">h</annotation></semantics></math></span>,</span> channel <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>p</mi></mrow><annotation encoding="application/x-tex">p</annotation></semantics></math></span> and state index <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>n</mi></mrow><annotation encoding="application/x-tex">n</annotation></semantics></math></span>:</span></p>
+
+<div class="katex-display"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mtable rowspacing="0.25em" columnalign="right left" columnspacing="0em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><msub><mi mathvariant="normal">Δ</mi><mi>h</mi></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mo>=</mo><mi mathvariant="normal">softplus</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mrow><mi>d</mi><mi>t</mi></mrow><mi>h</mi></msub><mo>+</mo><msub><mi>b</mi><mi>h</mi></msub><mo stretchy="false">)</mo><mo>=</mo><mi>ln</mi><mo>⁡</mo><mtext> ⁣</mtext><mrow><mo fence="true">(</mo><mn>1</mn><mo>+</mo><msup><mi>e</mi><mrow><msub><mrow><mi>d</mi><mi>t</mi></mrow><mi>h</mi></msub><mo>+</mo><msub><mi>b</mi><mi>h</mi></msub></mrow></msup><mo fence="true">)</mo></mrow></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><msub><mover accent="true"><mi>A</mi><mo>ˉ</mo></mover><mi>h</mi></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mo>=</mo><msup><mi>e</mi><mrow><msub><mi mathvariant="normal">Δ</mi><mi>h</mi></msub><msub><mi>A</mi><mi>h</mi></msub></mrow></msup><mspace width="2em"/><mo stretchy="false">(</mo><msub><mi>A</mi><mi>h</mi></msub><mo>&lt;</mo><mn>0</mn><mo separator="true">,</mo><mtext> so </mtext><mn>0</mn><mo>&lt;</mo><msub><mover accent="true"><mi>A</mi><mo>ˉ</mo></mover><mi>h</mi></msub><mo>&lt;</mo><mn>1</mn><mo stretchy="false">)</mo></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><msub><mi>S</mi><mrow><mi>h</mi><mo separator="true">,</mo><mi>p</mi><mo separator="true">,</mo><mi>n</mi></mrow></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mo>←</mo><msub><mover accent="true"><mi>A</mi><mo>ˉ</mo></mover><mi>h</mi></msub><mtext> </mtext><msub><mi>S</mi><mrow><mi>h</mi><mo separator="true">,</mo><mi>p</mi><mo separator="true">,</mo><mi>n</mi></mrow></msub><mo>+</mo><msub><mi mathvariant="normal">Δ</mi><mi>h</mi></msub><mtext> </mtext><msub><mi>x</mi><mrow><mi>h</mi><mo separator="true">,</mo><mi>p</mi></mrow></msub><mtext> </mtext><msub><mi>B</mi><mi>n</mi></msub></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><msub><mi>y</mi><mrow><mi>h</mi><mo separator="true">,</mo><mi>p</mi></mrow></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mo>=</mo><munder><mo>∑</mo><mi>n</mi></munder><msub><mi>S</mi><mrow><mi>h</mi><mo separator="true">,</mo><mi>p</mi><mo separator="true">,</mo><mi>n</mi></mrow></msub><mtext> </mtext><msub><mi>C</mi><mi>n</mi></msub><mo>+</mo><msub><mi>D</mi><mi>h</mi></msub><mtext> </mtext><msub><mi>x</mi><mrow><mi>h</mi><mo separator="true">,</mo><mi>p</mi></mrow></msub></mrow></mstyle></mtd></mtr></mtable><annotation encoding="application/x-tex">\begin{aligned}
+\Delta_h &amp;= \operatorname{softplus}(\mathit{dt}_h + b_h) = \ln\!\left(1 + e^{\mathit{dt}_h + b_h}\right) \\
+\bar{A}_h &amp;= e^{\Delta_h A_h} \qquad (A_h \lt 0,\ \text{so } 0 \lt \bar{A}_h \lt 1) \\
+S_{h,p,n} &amp;\leftarrow \bar{A}_h \, S_{h,p,n} + \Delta_h \, x_{h,p} \, B_n \\
+y_{h,p} &amp;= \sum_{n} S_{h,p,n} \, C_n + D_h \, x_{h,p}
+\end{aligned}</annotation></semantics></math></span></div>
+
+<p>In words: the old state fades by a factor <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mover accent="true"><mi>A</mi><mo>ˉ</mo></mover><mi>h</mi></msub></mrow><annotation encoding="application/x-tex">\bar{A}_h</annotation></semantics></math></span>,</span> the new input is added in through <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>B</mi></mrow><annotation encoding="application/x-tex">B</annotation></semantics></math></span>,</span> and the output is read back out through <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>C</mi></mrow><annotation encoding="application/x-tex">C</annotation></semantics></math></span>.</span> The state <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>S</mi></mrow><annotation encoding="application/x-tex">S</annotation></semantics></math></span> is the model's whole memory of the conversation: 16 × 48 × 32 = 24,576 numbers per layer, regardless of how long you chat.<span class="sidenote-wrap"><label for="sn-6" class="sidenote-number"></label><input type="checkbox" id="sn-6" class="sidenote-toggle"><span class="sidenote"><a href="https://en.wikipedia.org/wiki/Softplus">Softplus</a> is a smooth version of “clip negatives to zero”, so the step size <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="normal">Δ</mi></mrow><annotation encoding="application/x-tex">\Delta</annotation></semantics></math></span> is always positive. A bigger <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="normal">Δ</mi></mrow><annotation encoding="application/x-tex">\Delta</annotation></semantics></math></span> means “this token matters”: the state forgets more of the past and takes in more of the present.</span></span></p>
+
+<figure class="widget wide" data-widget="ssm">
+<figcaption><strong>Try it: one state number over 32 tokens.</strong> Click the token slots to place inputs, then move the sliders. The real layer runs 24,576 of these side by side, each head with its own <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mover accent="true"><mi>A</mi><mo>ˉ</mo></mover><mi>h</mi></msub></mrow><annotation encoding="application/x-tex">\bar{A}_h</annotation></semantics></math></span>,</span> each state index with its own <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>B</mi><mi>n</mi></msub></mrow><annotation encoding="application/x-tex">B_n</annotation></semantics></math></span> and <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>C</mi><mi>n</mi></msub></mrow><annotation encoding="application/x-tex">C_n</annotation></semantics></math></span>.</span></figcaption>
+<noscript><p>This figure needs JavaScript.</p></noscript>
+</figure>
+</section>
+
+<section data-sec="3">
+<h2 id="3-getting-the-model-onto-the-device">3. Getting the model onto the device</h2>
+
+<p>The <a href="https://huggingface.co/">Hugging Face</a> release stores everything as 32-bit floats in a <a href="https://huggingface.co/docs/safetensors"><code>safetensors</code></a> file. A converter script (<code>tools/convert.py</code>, standard-library Python only, so it runs inside the <a href="https://buildroot.org/">Buildroot</a> build) rewrites it into a compact <code>model.bin</code>:</p>
+
+<pre class="diagram">
+ model.bin
+ ┌──────────────────────────────────────────────────────────┐
+ │ "BRAI"  version  V D L E N H P K          (40 bytes)     │
+ ├──────────────────────────────────────────────────────────┤
+ │ embedding: 9,501 row scales (float)                      │
+ │            9,501 × 384 int8 values         3.65 MB       │
+ ├──────────────────────────────────────────────────────────┤
+ │ layer 1:  norm weights (float)                           │
+ │           input matrix: scale + 1,616 × 384 ternary      │
+ │                         packed 4 per byte  155 KB        │
+ │           conv weights, biases, dt bias, A, D (float)    │
+ │           gate-norm weights (float)                      │
+ │           output matrix: scale + 384 × 768 ternary       │
+ │                          packed 4 per byte  74 KB        │
+ ├──────────────────────────────────────────────────────────┤
+ │ layer 2 … layer 12  (same layout)                        │
+ ├──────────────────────────────────────────────────────────┤
+ │ final norm weights (float)                               │
+ └──────────────────────────────────────────────────────────┘
+                                         total 6.7 MB
+</pre>
+
+<p><strong>Packing ternary weights.</strong> A weight <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>w</mi><mo>∈</mo><mo stretchy="false">{</mo><mo>−</mo><mn>1</mn><mo separator="true">,</mo><mn>0</mn><mo separator="true">,</mo><mo>+</mo><mn>1</mn><mo stretchy="false">}</mo></mrow><annotation encoding="application/x-tex">w \in \{-1, 0, +1\}</annotation></semantics></math></span> becomes a digit <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>d</mi><mo>=</mo><mi>w</mi><mo>+</mo><mn>1</mn><mo>∈</mo><mo stretchy="false">{</mo><mn>0</mn><mo separator="true">,</mo><mn>1</mn><mo separator="true">,</mo><mn>2</mn><mo stretchy="false">}</mo></mrow><annotation encoding="application/x-tex">d = w + 1 \in \{0, 1, 2\}</annotation></semantics></math></span>.</span> Four digits make a number in <a href="https://en.wikipedia.org/wiki/Ternary_numeral_system">base 3</a>:</p>
+
+<div class="katex-display"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mi>c</mi><mo>=</mo><msub><mi>d</mi><mn>0</mn></msub><mo>+</mo><mn>3</mn><msub><mi>d</mi><mn>1</mn></msub><mo>+</mo><mn>9</mn><msub><mi>d</mi><mn>2</mn></msub><mo>+</mo><mn>27</mn><msub><mi>d</mi><mn>3</mn></msub><mo separator="true">,</mo><mspace width="2em"/><mn>0</mn><mo>≤</mo><mi>c</mi><mo>≤</mo><mn>80</mn></mrow><annotation encoding="application/x-tex">c = d_0 + 3 d_1 + 9 d_2 + 27 d_3, \qquad 0 \le c \le 80</annotation></semantics></math></span></div>
+
+<p>Since <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mn>3</mn><mn>4</mn></msup><mo>=</mo><mn>81</mn><mo>≤</mo><mn>256</mn></mrow><annotation encoding="application/x-tex">3^4 = 81 \le 256</annotation></semantics></math></span>,</span> four weights fit in one byte.<span class="sidenote-wrap"><label for="sn-7" class="sidenote-number"></label><input type="checkbox" id="sn-7" class="sidenote-toggle"><span class="sidenote">Two bits per weight would also fit four in a byte, but base 3 gives us something more useful: a table index, as the next section shows.</span></span></p>
+
+<pre class="diagram">
+ weights   +1   0  −1  +1
+ digits     2   1   0   2
+ code      2·1 + 1·3 + 0·9 + 2·27 = 59   → one byte: 59
+</pre>
+
+<p><strong>Quantising the embedding.</strong> Each of the 9,501 embedding rows gets its own scale <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>s</mi><mi>v</mi></msub><mo>=</mo><msub><mrow><mi>max</mi><mo>⁡</mo></mrow><mi>i</mi></msub><mi mathvariant="normal">∣</mi><msub><mi>e</mi><mrow><mi>v</mi><mo separator="true">,</mo><mi>i</mi></mrow></msub><mi mathvariant="normal">∣</mi><mi mathvariant="normal">/</mi><mn>127</mn></mrow><annotation encoding="application/x-tex">s_v = \max_i |e_{v,i}| / 127</annotation></semantics></math></span>,</span> and each value is stored as <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="normal">round</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>e</mi><mrow><mi>v</mi><mo separator="true">,</mo><mi>i</mi></mrow></msub><mi mathvariant="normal">/</mi><msub><mi>s</mi><mi>v</mi></msub><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">\operatorname{round}(e_{v,i} / s_v)</annotation></semantics></math></span>,</span> an int8.<span class="sidenote-wrap"><label for="sn-8" class="sidenote-number"></label><input type="checkbox" id="sn-8" class="sidenote-toggle"><span class="sidenote">This is “absmax” quantisation: the largest value in the row becomes ±127, and everything else is scaled by the same factor. One number per row, <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>s</mi><mi>v</mi></msub></mrow><annotation encoding="application/x-tex">s_v</annotation></semantics></math></span>,</span> is enough to undo it.</span></span></p>
+
+<figure class="widget wide" data-widget="absmax">
+<figcaption><strong>Try it: absmax rounding to int8.</strong> Drag the bars. The faint outline is what comes back after rounding, <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>q</mi><mi>i</mi></msub><mo>⋅</mo><mi>s</mi></mrow><annotation encoding="application/x-tex">q_i \cdot s</annotation></semantics></math></span>.</span> Add an outlier and watch every other value lose precision.</figcaption>
+<noscript><p>This figure needs JavaScript.</p></noscript>
+</figure>
+
+<p>The tokenizer file (<code>tokenizer.model</code>, a <a href="https://protobuf.dev/">protobuf</a>, Google's binary serialisation format) is parsed by hand into <code>tok.bin</code>.</p>
+</section>
+
+<section data-sec="4">
+<h2 id="4-ternary-weights-multiplying-without-multiplying">4. Ternary weights: multiplying without multiplying</h2>
+
+<p>A matrix–vector product computes, for each output row <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>r</mi></mrow><annotation encoding="application/x-tex">r</annotation></semantics></math></span>:</span></p>
+
+<div class="katex-display"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><msub><mrow><mi mathvariant="normal">out</mi><mo>⁡</mo></mrow><mi>r</mi></msub><mo>=</mo><munder><mo>∑</mo><mi>c</mi></munder><msub><mi>W</mi><mrow><mi>r</mi><mo separator="true">,</mo><mi>c</mi></mrow></msub><mtext> </mtext><msub><mi>q</mi><mi>c</mi></msub></mrow><annotation encoding="application/x-tex">\operatorname{out}_r = \sum_{c} W_{r,c} \, q_c</annotation></semantics></math></span></div>
+
+<p>With <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>W</mi><mrow><mi>r</mi><mo separator="true">,</mo><mi>c</mi></mrow></msub><mo>∈</mo><mo stretchy="false">{</mo><mo>−</mo><mn>1</mn><mo separator="true">,</mo><mn>0</mn><mo separator="true">,</mo><mo>+</mo><mn>1</mn><mo stretchy="false">}</mo></mrow><annotation encoding="application/x-tex">W_{r,c} \in \{-1, 0, +1\}</annotation></semantics></math></span>,</span> each term is <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>+</mo><msub><mi>q</mi><mi>c</mi></msub></mrow><annotation encoding="application/x-tex">+q_c</annotation></semantics></math></span>,</span> <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0</mn></mrow><annotation encoding="application/x-tex">0</annotation></semantics></math></span> or <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>−</mo><msub><mi>q</mi><mi>c</mi></msub></mrow><annotation encoding="application/x-tex">-q_c</annotation></semantics></math></span>.</span> Still, deciding which, one weight at a time, costs a few instructions per weight.</p>
+
+<p>The trick, used in the <a href="https://arxiv.org/abs/2407.00088">T-MAC</a> paper (Wei et al., 2024, on table lookups for low-bit models on edge CPUs) and in the <a href="https://github.com/hyperionaidev/smolmaxxing">smolmaxxing</a> project, is to take the inputs <strong>four at a time</strong>. Four inputs <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>q</mi><mn>0</mn></msub><mo separator="true">,</mo><msub><mi>q</mi><mn>1</mn></msub><mo separator="true">,</mo><msub><mi>q</mi><mn>2</mn></msub><mo separator="true">,</mo><msub><mi>q</mi><mn>3</mn></msub></mrow><annotation encoding="application/x-tex">q_0, q_1, q_2, q_3</annotation></semantics></math></span> can meet only <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mn>3</mn><mn>4</mn></msup><mo>=</mo><mn>81</mn></mrow><annotation encoding="application/x-tex">3^4 = 81</annotation></semantics></math></span> different weight patterns, so we compute all 81 possible sums once and store them in a <a href="https://en.wikipedia.org/wiki/Lookup_table">LUT</a> (lookup table):</p>
+
+<div class="katex-display"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mi>T</mi><mo stretchy="false">[</mo><mi>c</mi><mo stretchy="false">]</mo><mo>=</mo><munderover><mo>∑</mo><mrow><mi>k</mi><mo>=</mo><mn>0</mn></mrow><mn>3</mn></munderover><mo stretchy="false">(</mo><msub><mi>d</mi><mi>k</mi></msub><mo>−</mo><mn>1</mn><mo stretchy="false">)</mo><mtext> </mtext><msub><mi>q</mi><mi>k</mi></msub><mspace width="2em"/><mtext>for every </mtext><mi>c</mi><mo>=</mo><msub><mi>d</mi><mn>0</mn></msub><mo>+</mo><mn>3</mn><msub><mi>d</mi><mn>1</mn></msub><mo>+</mo><mn>9</mn><msub><mi>d</mi><mn>2</mn></msub><mo>+</mo><mn>27</mn><msub><mi>d</mi><mn>3</mn></msub></mrow><annotation encoding="application/x-tex">T[c] = \sum_{k=0}^{3} (d_k - 1)\, q_k \qquad \text{for every } c = d_0 + 3d_1 + 9d_2 + 27d_3</annotation></semantics></math></span></div>
+
+<p>Then each packed weight byte <em>is</em> the index of the answer:</p>
+
+<div class="katex-display"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><munderover><mo>∑</mo><mrow><mi>k</mi><mo>=</mo><mn>0</mn></mrow><mn>3</mn></munderover><msub><mi>W</mi><mrow><mi>r</mi><mo separator="true">,</mo><mn>4</mn><mi>g</mi><mo>+</mo><mi>k</mi></mrow></msub><mtext> </mtext><msub><mi>q</mi><mrow><mn>4</mn><mi>g</mi><mo>+</mo><mi>k</mi></mrow></msub><mo>=</mo><msub><mi>T</mi><mi>g</mi></msub><mo stretchy="false">[</mo><msub><mrow><mi mathvariant="normal">b</mi><mi mathvariant="normal">y</mi><mi mathvariant="normal">t</mi><mi mathvariant="normal">e</mi></mrow><mrow><mi>r</mi><mo separator="true">,</mo><mi>g</mi></mrow></msub><mo stretchy="false">]</mo></mrow><annotation encoding="application/x-tex">\sum_{k=0}^{3} W_{r,4g+k} \, q_{4g+k} = T_g[\mathrm{byte}_{r,g}]</annotation></semantics></math></span></div>
+
+<figure class="widget wide" data-widget="lut">
+<figcaption><strong>Try it: the 81-entry table for one group of four inputs.</strong> Change the inputs or click the weights. Every cell of the 9 × 9 grid is one possible weight pattern; click a cell to see which. The grid's rows and columns are the two halves of the code, explained below the figure.</figcaption>
+<pre class="diagram">
+ inputs of group g:   q0 = 5   q1 = −2   q2 = 7   q3 = 1
+ table T_g (81 entries, built once per token per group):
+   c:     0     1     2     3   …    59   …    80
+        ───   ───   ───   ───       ───        ───
+        −11    −6    −1   −13   …    −1   …    11
+                                      ▲
+ row r's byte for group g: 59 ────────┘   (weights +1 0 −1 +1)
+                     check: 5·1 + (−2)·0 + 7·(−1) + 1·1 = −1
+ T[0]  is all weights −1:  −5 + 2 − 7 − 1 = −11
+ T[80] is all weights +1:   5 − 2 + 7 + 1 =  11
+ one table read replaces four multiply-adds
+</pre>
+</figure>
+
+<p>Building the 81 entries naively would cost 81 × 4 multiply-adds. Instead, the engine splits the code into a low half <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>i</mi><mo>=</mo><msub><mi>d</mi><mn>0</mn></msub><mo>+</mo><mn>3</mn><msub><mi>d</mi><mn>1</mn></msub></mrow><annotation encoding="application/x-tex">i = d_0 + 3d_1</annotation></semantics></math></span> and a high half <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>j</mi><mo>=</mo><msub><mi>d</mi><mn>2</mn></msub><mo>+</mo><mn>3</mn><msub><mi>d</mi><mn>3</mn></msub></mrow><annotation encoding="application/x-tex">j = d_2 + 3d_3</annotation></semantics></math></span>,</span> computes 9 partial sums for each half, and adds them:</p>
+
+<div class="katex-display"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mi>T</mi><mo stretchy="false">[</mo><mi>i</mi><mo>+</mo><mn>9</mn><mi>j</mi><mo stretchy="false">]</mo><mo>=</mo><munder><munder><mrow><mo stretchy="false">(</mo><msub><mi>d</mi><mn>0</mn></msub><mo>−</mo><mn>1</mn><mo stretchy="false">)</mo><msub><mi>q</mi><mn>0</mn></msub><mo>+</mo><mo stretchy="false">(</mo><msub><mi>d</mi><mn>1</mn></msub><mo>−</mo><mn>1</mn><mo stretchy="false">)</mo><msub><mi>q</mi><mn>1</mn></msub></mrow><mo stretchy="true">⏟</mo></munder><mrow><mrow><mi mathvariant="normal">l</mi><mi mathvariant="normal">o</mi></mrow><mo stretchy="false">[</mo><mi>i</mi><mo stretchy="false">]</mo><mo separator="true">,</mo><mtext> </mtext><mn>9</mn><mtext> values</mtext></mrow></munder><mo>+</mo><munder><munder><mrow><mo stretchy="false">(</mo><msub><mi>d</mi><mn>2</mn></msub><mo>−</mo><mn>1</mn><mo stretchy="false">)</mo><msub><mi>q</mi><mn>2</mn></msub><mo>+</mo><mo stretchy="false">(</mo><msub><mi>d</mi><mn>3</mn></msub><mo>−</mo><mn>1</mn><mo stretchy="false">)</mo><msub><mi>q</mi><mn>3</mn></msub></mrow><mo stretchy="true">⏟</mo></munder><mrow><mrow><mi mathvariant="normal">h</mi><mi mathvariant="normal">i</mi></mrow><mo stretchy="false">[</mo><mi>j</mi><mo stretchy="false">]</mo><mo separator="true">,</mo><mtext> </mtext><mn>9</mn><mtext> values</mtext></mrow></munder></mrow><annotation encoding="application/x-tex">T[i + 9j] = \underbrace{(d_0 - 1) q_0 + (d_1 - 1) q_1}_{\mathrm{lo}[i],\ 9 \text{ values}}
+          + \underbrace{(d_2 - 1) q_2 + (d_3 - 1) q_3}_{\mathrm{hi}[j],\ 9 \text{ values}}</annotation></semantics></math></span></div>
+
+<p>That is 18 small sums and 81 additions per group of four inputs. Every one of the 1,616 rows then reuses the table, so building it is cheap by comparison.<span class="sidenote-wrap"><label for="sn-9" class="sidenote-number"></label><input type="checkbox" id="sn-9" class="sidenote-toggle"><span class="sidenote">In the figure above, the shaded header column holds the 9 values of <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mrow><mi mathvariant="normal">l</mi><mi mathvariant="normal">o</mi></mrow><mo stretchy="false">[</mo><mi>i</mi><mo stretchy="false">]</mo></mrow><annotation encoding="application/x-tex">\mathrm{lo}[i]</annotation></semantics></math></span> and the header row the 9 values of <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mrow><mi mathvariant="normal">h</mi><mi mathvariant="normal">i</mi></mrow><mo stretchy="false">[</mo><mi>j</mi><mo stretchy="false">]</mo></mrow><annotation encoding="application/x-tex">\mathrm{hi}[j]</annotation></semantics></math></span>.</span> Each cell is just its row header plus its column header.</span></span></p>
+
+<p>Finally, the integer result is turned back into a real number with two scales: the matrix's weight scale <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>s</mi><mi>W</mi></msub></mrow><annotation encoding="application/x-tex">s_W</annotation></semantics></math></span> and the input's rounding scale <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>s</mi><mi>q</mi></msub></mrow><annotation encoding="application/x-tex">s_q</annotation></semantics></math></span>:</span></p>
+
+<div class="katex-display"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><msubsup><mrow><mi mathvariant="normal">out</mi><mo>⁡</mo></mrow><mi>r</mi><mtext>real</mtext></msubsup><mo>=</mo><msub><mi>s</mi><mi>W</mi></msub><mo>⋅</mo><msub><mi>s</mi><mi>q</mi></msub><mo>⋅</mo><munder><mo>∑</mo><mi>c</mi></munder><msub><mi>W</mi><mrow><mi>r</mi><mo separator="true">,</mo><mi>c</mi></mrow></msub><mtext> </mtext><msub><mi>q</mi><mi>c</mi></msub></mrow><annotation encoding="application/x-tex">\operatorname{out}_r^{\text{real}} = s_W \cdot s_q \cdot \sum_c W_{r,c}\, q_c</annotation></semantics></math></span></div>
+
+<p>This version ran at <strong>331 ms per token (3.0 tokens per second)</strong>. It worked, and it was slow.</p>
+</section>
+
+<section data-sec="5">
+<h2 id="5-measure-first">5. Measure first</h2>
+
+<p>Before changing anything, we added a benchmark (<code>bench</code>) with an optional per-stage timer (build with <code>-DBRAINAI_PROF</code>). It feeds tokens through the model and reports the time spent in each part. The first profile:</p>
+
+<pre class="diagram wide">
+ stage                              ms/token   share
+ ─────                              ────────   ─────
+ ternary matrices (incl. tables)       127     ████████████████████  38%
+ LM head (scoring 9,501 words)          69     ███████████           21%
+ convolution + SiLU                     51     ████████              15%
+ gate + normalisation                   43     ███████               13%
+ SSM state update                       34     █████                 10%
+ other                                   7     █                      2%
+                                       ───
+                                       331
+</pre>
+
+<p>The surprise: the ternary maths we had designed for was barely a third of the time. Small per-element work done in emulated floating point (the convolution, SiLU, the gate, the normalisation) added up to more.</p>
+</section>
+
+<section data-sec="6">
+<h2 id="6-rearranging-the-weights-for-the-cache">6. Rearranging the weights for the cache</h2>
+
+<p><strong>Problem 1: the tables did not fit in the cache.</strong> The input matrix has 384 inputs, so 96 groups of four, so 96 tables of 81 entries. At 2 bytes per entry that is 96 × 162 = 15.5 KiB, the entire data cache. As the weights streamed through, they pushed the tables out, and every lookup risked a miss.</p>
+
+<p><strong>Fix: column blocks.</strong> At load time, the engine reorders the weights in place into blocks of 32 groups (128 columns). It builds the 32 tables for one block (32 × 162 bytes ≈ 5 KiB, comfortably cached), runs every row over that block, then moves on to the next block and adds to the running sums.</p>
+
+<pre class="diagram">
+ original layout: each row is one long line of bytes
+
+          group:   0    1    2   …   95
+ row 0           [b ][b ][b ]   … [b ]
+ row 1           [b ][b ][b ]   … [b ]
+ …
+ row 1615        [b ][b ][b ]   … [b ]
+
+          all 96 tables needed for every row  →  15.5 KiB of tables
+
+ repacked: three column blocks, processed one after another
+          ┌─ block 0 ─┐┌─ block 1 ─┐┌─ block 2 ─┐
+          groups 0–31   groups 32–63  groups 64–95
+                │
+                ▼
+          build 32 tables (5 KiB, stays in cache)
+          run all 1,616 rows over these 32 groups
+          then block 1, then block 2, adding up
+</pre>
+
+<p><strong>Problem 2: one byte per load.</strong> Reading one byte at a time from memory wastes three quarters of each 32-bit load.</p>
+
+<p><strong>Fix: four rows per word.</strong> Inside a block, rows are taken four at a time. For each group, the four rows' bytes sit next to each other in one 32-bit word. One load fetches the codes for four rows, and all four lookups use the same table:</p>
+
+<pre class="diagram">
+ inside a block, rows r … r+3, groups g = 0 … 31:
+  memory:  [ r  r+1 r+2 r+3 ] [ r  r+1 r+2 r+3 ] [ r  r+1 r+2 r+3 ] …
+           └──── group 0 ────┘ └──── group 1 ────┘ └──── group 2 ────┘
+                one 32-bit word     one word           one word
+
+  for each word v:
+     s0 += T[ v        &amp; 0xff ]   ← row r
+     s1 += T[ (v >> 8)  &amp; 0xff ]   ← row r+1
+     s2 += T[ (v >> 16) &amp; 0xff ]   ← row r+2
+     s3 += T[  v >> 24        ]   ← row r+3
+     T  += next group's table
+</pre>
+
+<figure class="widget wide" data-widget="repack">
+<figcaption><strong>Try it: the same weights in two memory orders.</strong> A small matrix (8 rows × 12 groups) stands in for the real one (1,616 rows × 96 groups). Press play to watch which bytes each load fetches and which tables must stay in the cache. The meter underneath does the sums for the real matrix and its block size <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>G</mi><mi>B</mi></mrow><annotation encoding="application/x-tex">GB</annotation></semantics></math></span>.</span></figcaption>
+<noscript><p>This figure needs JavaScript.</p></noscript>
+</figure>
+
+<p><strong>Fix 3: store byte offsets, not indexes.</strong> Table entries are 16-bit, so entry <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>c</mi></mrow><annotation encoding="application/x-tex">c</annotation></semantics></math></span> lives at byte offset <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mi>c</mi></mrow><annotation encoding="application/x-tex">2c</annotation></semantics></math></span>.</span> The repacker stores <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mi>c</mi></mrow><annotation encoding="application/x-tex">2c</annotation></semantics></math></span> instead of <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>c</mi></mrow><annotation encoding="application/x-tex">c</annotation></semantics></math></span> (the largest code, 80, becomes 160, which still fits in a byte). The lookup becomes a single ARM <code>ldrsh</code> instruction (“load signed halfword from base + offset”) with no index arithmetic.</p>
+
+<p><strong>Two compiler details.</strong> The mask <code>0xff</code> is kept in a register (<a href="https://gcc.gnu.org/">GCC</a>, the GNU Compiler Collection, otherwise emits two instructions for “shift then mask with a constant”), and the table builder uses nested loops instead of computing <code>i % 3</code> and <code>i / 3</code> per entry, which are slow on a CPU without a divide instruction.<span class="sidenote-wrap"><label for="sn-10" class="sidenote-number"></label><input type="checkbox" id="sn-10" class="sidenote-toggle"><span class="sidenote">ARMv5 has no integer divide instruction at all. A <code>/</code> or <code>%</code> by a variable becomes a call to a library routine that divides one bit at a time.</span></span></p>
+
+<p>Block size turned out not to matter once the four-rows-per-word layout was in: 16, 32 and 48 groups per block all ran at about 257 ms per token. The win came from fitting in the cache at all, not from tuning.</p>
+</section>
+
+<section data-sec="7">
+<h2 id="7-scoring-the-vocabulary-with-dsp-instructions">7. Scoring the vocabulary with DSP instructions</h2>
+
+<p>At the end of each step, the model scores all 9,501 words: a <a href="https://en.wikipedia.org/wiki/Dot_product">dot product</a> between the final vector <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>q</mi></mrow><annotation encoding="application/x-tex">q</annotation></semantics></math></span> (384 int8 values) and every embedding row <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>e</mi><mi>v</mi></msub></mrow><annotation encoding="application/x-tex">e_v</annotation></semantics></math></span>:</span></p>
+
+<div class="katex-display"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><msub><mrow><mi mathvariant="normal">l</mi><mi mathvariant="normal">o</mi><mi mathvariant="normal">g</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">t</mi></mrow><mi>v</mi></msub><mo>=</mo><msub><mi>s</mi><mi>v</mi></msub><mo>⋅</mo><msub><mi>s</mi><mi>q</mi></msub><mo>⋅</mo><munderover><mo>∑</mo><mrow><mi>i</mi><mo>=</mo><mn>0</mn></mrow><mn>383</mn></munderover><msub><mi>e</mi><mrow><mi>v</mi><mo separator="true">,</mo><mi>i</mi></mrow></msub><mtext> </mtext><msub><mi>q</mi><mi>i</mi></msub></mrow><annotation encoding="application/x-tex">\mathrm{logit}_v = s_v \cdot s_q \cdot \sum_{i=0}^{383} e_{v,i}\, q_i</annotation></semantics></math></span></div>
+
+<p>That is 3.6 million multiply-adds per token, and reading 3.65 MB of embedding table. At 168 MB/s, the reading alone takes about 22 ms.</p>
+
+<p>The ARM926 has DSP instructions that treat a 32-bit register as two 16-bit halves:</p>
+
+<pre class="diagram">
+ SMLABB  acc += bottom16(a) × bottom16(b)
+ SMLATT  acc += top16(a)    × top16(b)
+
+ one instruction, one cycle, signed 16 × 16 → added to 32-bit acc
+</pre>
+
+<p>To feed them, we load <strong>four embedding bytes as one 32-bit word</strong> and split it into two words, each holding two bytes in its 16-bit halves:</p>
+
+<pre class="diagram">
+ word from the table:   [ b3 | b2 | b1 | b0 ]
+
+ w &amp; 0x00ff00ff       = [ 00 | b2 | 00 | b0 ]   halves: (b0, b2)
+ (w >> 8) &amp; 0x00ff00ff = [ 00 | b3 | 00 | b1 ]   halves: (b1, b3)
+
+ q prepared once per token as 16-bit pairs:
+   q2[0] = [ q2 | q0 ]
+   q2[1] = [ q3 | q1 ]
+
+ a += b0·q0  (SMLABB)      b += b2·q2  (SMLATT)
+ a += b1·q1  (SMLABB)      b += b3·q3  (SMLATT)
+</pre>
+
+<p>Masking only works if the bytes are <strong>unsigned</strong>: a negative byte would need its sign extended into the top 8 bits of its half. So at load time, every embedding byte is stored as <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>e</mi><mo>+</mo><mn>128</mn></mrow><annotation encoding="application/x-tex">e + 128</annotation></semantics></math></span> (a range of 0 to 255).<span class="sidenote-wrap"><label for="sn-11" class="sidenote-number"></label><input type="checkbox" id="sn-11" class="sidenote-toggle"><span class="sidenote">In practice this is an <a href="https://en.wikipedia.org/wiki/Exclusive_or">XOR</a> (exclusive or) with <code>0x80</code>, which flips the top bit and turns the two's-complement byte −128…127 into 0…255.</span></span> The extra <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>128</mn></mrow><annotation encoding="application/x-tex">128</annotation></semantics></math></span> is removed once per word, not per multiply:</p>
+
+<div class="katex-display"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><munder><mo>∑</mo><mi>i</mi></munder><msub><mi>e</mi><mi>i</mi></msub><mtext> </mtext><msub><mi>q</mi><mi>i</mi></msub><mo>=</mo><munder><mo>∑</mo><mi>i</mi></munder><mo stretchy="false">(</mo><msub><mi>e</mi><mi>i</mi></msub><mo>+</mo><mn>128</mn><mo stretchy="false">)</mo><mtext> </mtext><msub><mi>q</mi><mi>i</mi></msub><mtext>  </mtext><mo>−</mo><mtext>  </mtext><mn>128</mn><munder><mo>∑</mo><mi>i</mi></munder><msub><mi>q</mi><mi>i</mi></msub></mrow><annotation encoding="application/x-tex">\sum_i e_i\, q_i = \sum_i (e_i + 128)\, q_i \; - \; 128 \sum_i q_i</annotation></semantics></math></span></div>
+
+<p>The second term, <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>128</mn><msub><mo>∑</mo><mi>i</mi></msub><msub><mi>q</mi><mi>i</mi></msub></mrow><annotation encoding="application/x-tex">128 \sum_i q_i</annotation></semantics></math></span>,</span> is the same for all 9,501 rows, so it is computed once per token.</p>
+
+<p>The same section also fixed the sampler: the <a href="https://arxiv.org/abs/1909.05858">repetition penalty</a> used to scan the last 64 tokens for each of the 9,501 words (608,000 comparisons). Now it marks those 64 tokens in an array, checks the mark per word, and clears the marks afterwards.</p>
+
+<p>All of section 6 and this section are <strong>bit-exact</strong>: the logits were identical before and after, which we checked with a checksum after every change. Together they brought the time to <strong>257 ms per token (3.9 tokens/s)</strong>.<span class="sidenote-wrap"><label for="sn-12" class="sidenote-number"></label><input type="checkbox" id="sn-12" class="sidenote-toggle"><span class="sidenote"><code>bench</code> prints a checksum of the final logits after a fixed run, so any change that is supposed to be exact can be checked in one line.</span></span></p>
+</section>
+
+<section data-sec="8">
+<h2 id="8-replacing-floating-point-with-integers">8. Replacing floating point with integers</h2>
+
+<p>The biggest single win. Everything element-wise inside a layer now uses 32-bit fixed-point integers.</p>
+
+<div data-sec="8.1">
+<h3 id="fixed-point-in-one-paragraph">Fixed point in one paragraph</h3>
+
+<p>A <a href="https://en.wikipedia.org/wiki/Fixed-point_arithmetic">fixed-point</a> number stores a real value <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>v</mi></mrow><annotation encoding="application/x-tex">v</annotation></semantics></math></span> as the integer <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="normal">round</mi><mo>⁡</mo><mo stretchy="false">(</mo><mi>v</mi><mo>⋅</mo><msup><mn>2</mn><mi>f</mi></msup><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">\operatorname{round}(v \cdot 2^f)</annotation></semantics></math></span>.</span> We write this as <strong><a href="https://en.wikipedia.org/wiki/Q_(number_format)">Q<span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>f</mi></mrow><annotation encoding="application/x-tex">f</annotation></semantics></math></span></a></strong>: Q16 means “16 fractional bits”, so the integer 98,304 in Q16 is <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>98</mn><mo separator="true" lspace="0em" rspace="0em">,</mo><mn>304</mn><mi mathvariant="normal">/</mi><msup><mn>2</mn><mn>16</mn></msup><mo>=</mo><mn>1.5</mn></mrow><annotation encoding="application/x-tex">98{,}304 / 2^{16} = 1.5</annotation></semantics></math></span>.</span> The rules are simple:</p>
+
+<div class="katex-display"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mtable rowspacing="0.25em" columnalign="right left" columnspacing="0em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mi mathvariant="normal">Q</mi><mi>a</mi><mo>+</mo><mi mathvariant="normal">Q</mi><mi>a</mi></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mo>=</mo><mi mathvariant="normal">Q</mi><mi>a</mi></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mi mathvariant="normal">Q</mi><mi>a</mi><mo>×</mo><mi mathvariant="normal">Q</mi><mi>b</mi></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mo>=</mo><mi mathvariant="normal">Q</mi><mo stretchy="false">(</mo><mi>a</mi><mo>+</mo><mi>b</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mi mathvariant="normal">Q</mi><mi>a</mi><mo>≫</mo><mi>s</mi></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mo>=</mo><mi mathvariant="normal">Q</mi><mo stretchy="false">(</mo><mi>a</mi><mo>−</mo><mi>s</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd></mtr></mtable><annotation encoding="application/x-tex">\begin{aligned}
+\mathrm{Q}a + \mathrm{Q}a &amp;= \mathrm{Q}a \\
+\mathrm{Q}a \times \mathrm{Q}b &amp;= \mathrm{Q}(a + b) \\
+\mathrm{Q}a \gg s &amp;= \mathrm{Q}(a - s)
+\end{aligned}</annotation></semantics></math></span></div>
+
+<p>So multiplying two Q16 numbers gives Q32, and shifting right by 16 brings it back to Q16. One integer multiply and one shift replace a software float multiply that costs tens of instructions.<span class="sidenote-wrap"><label for="sn-13" class="sidenote-number"></label><input type="checkbox" id="sn-13" class="sidenote-toggle"><span class="sidenote">Think of it as counting in fixed small units, like storing money as whole cents. Q16 counts in units of <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mi mathvariant="normal">/</mi><mn>65</mn><mo separator="true" lspace="0em" rspace="0em">,</mo><mn>536</mn></mrow><annotation encoding="application/x-tex">1/65{,}536</annotation></semantics></math></span>.</span></span></span></p>
+
+<figure class="widget wide" data-widget="qformat">
+<figcaption><strong>Try it: one number in Q<span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>f</mi></mrow><annotation encoding="application/x-tex">f</annotation></semantics></math></span>.</span></strong> Type a value and move the binary point. More fractional bits give finer steps but a smaller range.</figcaption>
+<noscript><p>This figure needs JavaScript.</p></noscript>
+</figure>
+
+<p>The engine uses:</p>
+
+<div class="wide"><table>
+<thead><tr><th>Quantity</th><th>Format</th><th>Range</th></tr></thead>
+<tbody>
+<tr><td>activations <span class="bx-nowrap">(<span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>z</mi></mrow><annotation encoding="application/x-tex">z</annotation></semantics></math></span>,</span> <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mi>x</mi><mo mathvariant="normal" lspace="0em" rspace="0em">′</mo></msup></mrow><annotation encoding="application/x-tex">x&#x27;</annotation></semantics></math></span>,</span> <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>B</mi></mrow><annotation encoding="application/x-tex">B</annotation></semantics></math></span>,</span> <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>C</mi></mrow><annotation encoding="application/x-tex">C</annotation></semantics></math></span>,</span> <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>y</mi></mrow><annotation encoding="application/x-tex">y</annotation></semantics></math></span>)</span></td><td>Q16</td><td>±32,768</td></tr>
+<tr><td>convolution weights</td><td>Q20</td><td>±2,048, finer steps for small weights</td></tr>
+<tr><td>SSM state <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>S</mi></mrow><annotation encoding="application/x-tex">S</annotation></semantics></math></span></td><td>Q20</td><td>±2,048</td></tr>
+<tr><td>decay <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mover accent="true"><mi>A</mi><mo>ˉ</mo></mover></mrow><annotation encoding="application/x-tex">\bar{A}</annotation></semantics></math></span></td><td>Q31</td><td><span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false">[</mo><mn>0</mn><mo separator="true">,</mo><mn>1</mn><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">[0, 1)</annotation></semantics></math></span>,</span> as precise as 32 bits allow</td></tr>
+</tbody>
+</table></div>
+</div>
+
+<div data-sec="8.2">
+<h3 id="from-the-matrix-result-to-q16">From the matrix result to Q16</h3>
+
+<p>The ternary matrix produces an integer sum <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>a</mi><mi>r</mi></msub></mrow><annotation encoding="application/x-tex">a_r</annotation></semantics></math></span>.</span> Its real value is <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>a</mi><mi>r</mi></msub><mo>⋅</mo><mi>s</mi></mrow><annotation encoding="application/x-tex">a_r \cdot s</annotation></semantics></math></span>,</span> where <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>s</mi></mrow><annotation encoding="application/x-tex">s</annotation></semantics></math></span> is a float scale that changes per token. To get Q16 without a float per element, the engine converts <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>s</mi></mrow><annotation encoding="application/x-tex">s</annotation></semantics></math></span> once per token into an integer multiplier <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>m</mi></mrow><annotation encoding="application/x-tex">m</annotation></semantics></math></span> and shift <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>k</mi></mrow><annotation encoding="application/x-tex">k</annotation></semantics></math></span>:</span></p>
+
+<div class="katex-display"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mi>s</mi><mo>=</mo><mi>f</mi><mo>⋅</mo><msup><mn>2</mn><mi>e</mi></msup><mtext>  </mtext><mo stretchy="false">(</mo><mn>0.5</mn><mo>≤</mo><mi mathvariant="normal">∣</mi><mi>f</mi><mi mathvariant="normal">∣</mi><mo>&lt;</mo><mn>1</mn><mo stretchy="false">)</mo><mo separator="true">,</mo><mspace width="2em"/><mi>m</mi><mo>=</mo><mi>f</mi><mo>⋅</mo><msup><mn>2</mn><mn>30</mn></msup><mo separator="true">,</mo><mspace width="2em"/><mi>k</mi><mo>=</mo><mn>14</mn><mo>−</mo><mi>e</mi></mrow><annotation encoding="application/x-tex">s = f \cdot 2^{e}\ \ (0.5 \le |f| \lt 1), \qquad m = f \cdot 2^{30}, \qquad k = 14 - e</annotation></semantics></math></span></div>
+
+<div class="katex-display"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mo stretchy="false">(</mo><msub><mi>a</mi><mi>r</mi></msub><mo>⋅</mo><mi>m</mi><mo stretchy="false">)</mo><mo>≫</mo><mi>k</mi><mtext>  </mtext><mo>=</mo><mtext>  </mtext><msub><mi>a</mi><mi>r</mi></msub><mo>⋅</mo><mi>f</mi><mo>⋅</mo><msup><mn>2</mn><mrow><mn>30</mn><mo>−</mo><mn>14</mn><mo>+</mo><mi>e</mi></mrow></msup><mtext>  </mtext><mo>=</mo><mtext>  </mtext><msub><mi>a</mi><mi>r</mi></msub><mo>⋅</mo><mi>s</mi><mo>⋅</mo><msup><mn>2</mn><mn>16</mn></msup></mrow><annotation encoding="application/x-tex">(a_r \cdot m) \gg k \;=\; a_r \cdot f \cdot 2^{30 - 14 + e} \;=\; a_r \cdot s \cdot 2^{16}</annotation></semantics></math></span></div>
+
+<p>That is one 64-bit multiply and shift per element.<span class="sidenote-wrap"><label for="sn-14" class="sidenote-number"></label><input type="checkbox" id="sn-14" class="sidenote-toggle"><span class="sidenote">Splitting <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>s</mi></mrow><annotation encoding="application/x-tex">s</annotation></semantics></math></span> into <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>f</mi><mo>⋅</mo><msup><mn>2</mn><mi>e</mi></msup></mrow><annotation encoding="application/x-tex">f \cdot 2^e</annotation></semantics></math></span> is what C's <code>frexpf</code> does; it is how a float is stored anyway, as a mantissa and an exponent.</span></span></p>
+</div>
+
+<div data-sec="8.3">
+<h3 id="silu-with-a-table">SiLU with a table</h3>
+
+<p><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>σ</mi><mo stretchy="false">(</mo><mi>x</mi><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">\sigma(x)</annotation></semantics></math></span> needs <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mi>e</mi><mrow><mo>−</mo><mi>x</mi></mrow></msup></mrow><annotation encoding="application/x-tex">e^{-x}</annotation></semantics></math></span>,</span> expensive without an FPU. Instead, the engine precomputes 1,025 values of <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>σ</mi></mrow><annotation encoding="application/x-tex">\sigma</annotation></semantics></math></span> at load time, over <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false">[</mo><mo>−</mo><mn>16</mn><mo separator="true">,</mo><mn>16</mn><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">[-16, 16)</annotation></semantics></math></span> in steps of <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mi mathvariant="normal">/</mi><mn>32</mn></mrow><annotation encoding="application/x-tex">1/32</annotation></semantics></math></span>,</span> and <a href="https://en.wikipedia.org/wiki/Linear_interpolation">interpolates linearly</a> between neighbours:</p>
+
+<figure class="widget wide" data-widget="sigmoid">
+<figcaption><strong>Try it: the sigmoid table.</strong> Move <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>x</mi></mrow><annotation encoding="application/x-tex">x</annotation></semantics></math></span>.</span> The zoomed view shows the two table entries around it and the straight line drawn between them.</figcaption>
+<pre class="diagram">
+ σ(x)
+ 1.0 ┤                          ●●●●●●●●●  (≥ 16: exactly 1)
+     │                      ●●●
+ 0.5 ┤                 ●●●●            each ● is one table entry,
+     │            ●●●                  1/32 apart
+ 0.0 ┤●●●●●●●●●●●                       (≤ −16: exactly 0)
+     └──────────────────────────────── x
+    −16              0               16
+ between entries i and i+1:   σ ≈ t[i] + (t[i+1] − t[i]) · frac
+</pre>
+</figure>
+
+<p>For <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>x</mi></mrow><annotation encoding="application/x-tex">x</annotation></semantics></math></span> in Q16, the table index and the fraction come straight out of the bits, because <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mn>2</mn><mn>16</mn></msup><mi mathvariant="normal">/</mi><mn>32</mn><mo>=</mo><msup><mn>2</mn><mn>11</mn></msup></mrow><annotation encoding="application/x-tex">2^{16} / 32 = 2^{11}</annotation></semantics></math></span>:</span></p>
+
+<div class="katex-display"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mi>u</mi><mo>=</mo><mi>x</mi><mo>+</mo><mn>16</mn><mo>⋅</mo><msup><mn>2</mn><mn>16</mn></msup><mo separator="true">,</mo><mspace width="2em"/><mi>i</mi><mo>=</mo><mi>u</mi><mo>≫</mo><mn>11</mn><mo separator="true">,</mo><mspace width="2em"/><mrow><mi mathvariant="normal">f</mi><mi mathvariant="normal">r</mi><mi mathvariant="normal">a</mi><mi mathvariant="normal">c</mi></mrow><mo>=</mo><mo stretchy="false">(</mo><mi>u</mi><mtext> </mtext><mo lspace="0.22em" rspace="0.22em"><mrow><mi mathvariant="normal">m</mi><mi mathvariant="normal">o</mi><mi mathvariant="normal">d</mi></mrow></mo><mtext> </mtext><msup><mn>2</mn><mn>11</mn></msup><mo stretchy="false">)</mo><mi mathvariant="normal">/</mi><msup><mn>2</mn><mn>11</mn></msup></mrow><annotation encoding="application/x-tex">u = x + 16 \cdot 2^{16}, \qquad i = u \gg 11, \qquad \mathrm{frac} = (u \bmod 2^{11}) / 2^{11}</annotation></semantics></math></span></div>
+
+<p>Then <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="normal">SiLU</mi><mo>⁡</mo><mo stretchy="false">(</mo><mi>x</mi><mo stretchy="false">)</mo><mo>=</mo><mo stretchy="false">(</mo><mi>x</mi><mo>⋅</mo><mi>σ</mi><mo stretchy="false">(</mo><mi>x</mi><mo stretchy="false">)</mo><mo stretchy="false">)</mo><mo>≫</mo><mn>16</mn></mrow><annotation encoding="application/x-tex">\operatorname{SiLU}(x) = (x \cdot \sigma(x)) \gg 16</annotation></semantics></math></span>.</span></p>
+</div>
+
+<div data-sec="8.4">
+<h3 id="the-ssm-update-in-integers">The SSM update in integers</h3>
+
+<p>Recall the update <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>S</mi><mo>←</mo><mover accent="true"><mi>A</mi><mo>ˉ</mo></mover><mi>S</mi><mo>+</mo><mi mathvariant="normal">Δ</mi><mtext> </mtext><mi>x</mi><mtext> </mtext><mi>B</mi></mrow><annotation encoding="application/x-tex">S \leftarrow \bar{A} S + \Delta\, x\, B</annotation></semantics></math></span>.</span> Per layer there are 16 × 48 × 32 = 24,576 of them, so this inner loop matters:</p>
+
+<ul>
+<li><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mover accent="true"><mi>A</mi><mo>ˉ</mo></mover></mrow><annotation encoding="application/x-tex">\bar{A}</annotation></semantics></math></span> is computed once per head (16 per layer, still in float) and stored as Q31: <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mover accent="true"><mi>A</mi><mo>ˉ</mo></mover><mrow><mi>Q</mi><mn>31</mn></mrow></msub><mo>=</mo><mover accent="true"><mi>A</mi><mo>ˉ</mo></mover><mo>⋅</mo><msup><mn>2</mn><mn>31</mn></msup></mrow><annotation encoding="application/x-tex">\bar{A}_{Q31} = \bar{A} \cdot 2^{31}</annotation></semantics></math></span>.</span> Then <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mover accent="true"><mi>A</mi><mo>ˉ</mo></mover><mo>⋅</mo><mi>S</mi><mo>=</mo><mo stretchy="false">(</mo><mi>S</mi><mo>⋅</mo><msub><mover accent="true"><mi>A</mi><mo>ˉ</mo></mover><mrow><mi>Q</mi><mn>31</mn></mrow></msub><mo stretchy="false">)</mo><mo>≫</mo><mn>31</mn></mrow><annotation encoding="application/x-tex">\bar{A} \cdot S = (S \cdot \bar{A}_{Q31}) \gg 31</annotation></semantics></math></span>.</span> The engine takes the high 32 bits of the 64-bit product (that is, <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>≫</mo><mn>32</mn></mrow><annotation encoding="application/x-tex">\gg 32</annotation></semantics></math></span>)</span> and shifts left by one, which the CPU does in one <code>SMULL</code> instruction plus a shift.</li>
+<li><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="normal">Δ</mi><mi>x</mi></mrow><annotation encoding="application/x-tex">\Delta x</annotation></semantics></math></span> is computed once per channel in Q20.</li>
+<li><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>B</mi></mrow><annotation encoding="application/x-tex">B</annotation></semantics></math></span> is scaled down to fit in 16 bits: <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>B</mi><mn>16</mn></msub><mo>=</mo><mi>B</mi><mo>≫</mo><msub><mi>s</mi><mi>b</mi></msub></mrow><annotation encoding="application/x-tex">B_{16} = B \gg s_b</annotation></semantics></math></span>,</span> where <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>s</mi><mi>b</mi></msub></mrow><annotation encoding="application/x-tex">s_b</annotation></semantics></math></span> is the smallest shift that makes every <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>B</mi><mi>n</mi></msub></mrow><annotation encoding="application/x-tex">B_n</annotation></semantics></math></span> fit. Then <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="normal">Δ</mi><mi>x</mi><mo>⋅</mo><mi>B</mi><mo>=</mo><mo stretchy="false">(</mo><mi mathvariant="normal">SMULWB</mi><mo>⁡</mo><mo stretchy="false">(</mo><mi mathvariant="normal">Δ</mi><mi>x</mi><mo separator="true">,</mo><msub><mi>B</mi><mn>16</mn></msub><mo stretchy="false">)</mo><mo stretchy="false">)</mo><mo>≪</mo><msub><mi>s</mi><mi>b</mi></msub></mrow><annotation encoding="application/x-tex">\Delta x \cdot B = (\operatorname{SMULWB}(\Delta x, B_{16})) \ll s_b</annotation></semantics></math></span>,</span> where <code>SMULWB</code> is the DSP instruction “32-bit × bottom 16 bits, keep the top 32 of the 48-bit result”, i.e. <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false">(</mo><mi>a</mi><mo>⋅</mo><mi>b</mi><mo stretchy="false">)</mo><mo>≫</mo><mn>16</mn></mrow><annotation encoding="application/x-tex">(a \cdot b) \gg 16</annotation></semantics></math></span>.</span></li>
+</ul>
+
+<pre class="diagram">
+ per state element n (24,576 per layer):
+   decay:  hi = (S[n] × Ā_Q31) >> 32          SMULL, high word
+   input:  v  = SMULWB(Δx, B16[n]) &lt;&lt; s_b     one DSP instruction
+           S[n] = v + (hi &lt;&lt; 1)
+   output: acc += S[n] × C[n]                 64-bit multiply-add
+</pre>
+
+<figure class="widget wide" data-widget="smulwb">
+<figcaption><strong>Try it: one SMULWB, bit by bit.</strong> Set <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="normal">Δ</mi><mi>x</mi></mrow><annotation encoding="application/x-tex">\Delta x</annotation></semantics></math></span> and <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>B</mi></mrow><annotation encoding="application/x-tex">B</annotation></semantics></math></span>.</span> The instruction ignores the top half of its second register, multiplies, and keeps only the top 32 of the 48 result bits.</figcaption>
+<noscript><p>This figure needs JavaScript.</p></noscript>
+</figure>
+</div>
+
+<div data-sec="8.5">
+<h3 id="normalisation-the-square-root-that-cancels">Normalisation: the square root that cancels</h3>
+
+<p>Both normalisation steps compute an <a href="https://arxiv.org/abs/1910.07467">RMSNorm</a> (<a href="https://en.wikipedia.org/wiki/Root_mean_square">root mean square</a> normalisation) and then immediately round the result to int8. Write <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>r</mi><mo>=</mo><msqrt><mrow><mfrac><mn>1</mn><mi>n</mi></mfrac><msub><mo>∑</mo><mi>i</mi></msub><msubsup><mi>x</mi><mi>i</mi><mn>2</mn></msubsup></mrow></msqrt></mrow><annotation encoding="application/x-tex">r = \sqrt{\tfrac{1}{n}\sum_i x_i^2}</annotation></semantics></math></span> and <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>u</mi><mi>i</mi></msub><mo>=</mo><msub><mi>w</mi><mi>i</mi></msub><msub><mi>x</mi><mi>i</mi></msub><mi mathvariant="normal">/</mi><mi>r</mi></mrow><annotation encoding="application/x-tex">u_i = w_i x_i / r</annotation></semantics></math></span>.</span> Rounding to int8 by the largest absolute value gives:</p>
+
+<div class="katex-display"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><msub><mi>q</mi><mi>i</mi></msub><mo>=</mo><mi mathvariant="normal">round</mi><mo>⁡</mo><mtext> ⁣</mtext><mrow><mo fence="true">(</mo><mn>127</mn><mo>⋅</mo><mfrac><msub><mi>u</mi><mi>i</mi></msub><mrow><munder><mrow><mi>max</mi><mo>⁡</mo></mrow><mi>j</mi></munder><mi mathvariant="normal">∣</mi><msub><mi>u</mi><mi>j</mi></msub><mi mathvariant="normal">∣</mi></mrow></mfrac><mo fence="true">)</mo></mrow><mo>=</mo><mi mathvariant="normal">round</mi><mo>⁡</mo><mtext> ⁣</mtext><mrow><mo fence="true">(</mo><mn>127</mn><mo>⋅</mo><mfrac><mrow><msub><mi>w</mi><mi>i</mi></msub><msub><mi>x</mi><mi>i</mi></msub><mi mathvariant="normal">/</mi><mi>r</mi></mrow><mrow><munder><mrow><mi>max</mi><mo>⁡</mo></mrow><mi>j</mi></munder><mi mathvariant="normal">∣</mi><msub><mi>w</mi><mi>j</mi></msub><msub><mi>x</mi><mi>j</mi></msub><mi mathvariant="normal">∣</mi><mi mathvariant="normal">/</mi><mi>r</mi></mrow></mfrac><mo fence="true">)</mo></mrow><mo>=</mo><mi mathvariant="normal">round</mi><mo>⁡</mo><mtext> ⁣</mtext><mrow><mo fence="true">(</mo><mn>127</mn><mo>⋅</mo><mfrac><mrow><msub><mi>w</mi><mi>i</mi></msub><msub><mi>x</mi><mi>i</mi></msub></mrow><mrow><munder><mrow><mi>max</mi><mo>⁡</mo></mrow><mi>j</mi></munder><mi mathvariant="normal">∣</mi><msub><mi>w</mi><mi>j</mi></msub><msub><mi>x</mi><mi>j</mi></msub><mi mathvariant="normal">∣</mi></mrow></mfrac><mo fence="true">)</mo></mrow></mrow><annotation encoding="application/x-tex">q_i = \operatorname{round}\!\left(127 \cdot \frac{u_i}{\max_j |u_j|}\right)
+    = \operatorname{round}\!\left(127 \cdot \frac{w_i x_i / r}{\max_j |w_j x_j| / r}\right)
+    = \operatorname{round}\!\left(127 \cdot \frac{w_i x_i}{\max_j |w_j x_j|}\right)</annotation></semantics></math></span></div>
+
+<p>The <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>r</mi></mrow><annotation encoding="application/x-tex">r</annotation></semantics></math></span> cancels. The int8 values do not depend on the RMS at all; only the scale that goes with them does:<span class="sidenote-wrap"><label for="sn-15" class="sidenote-number"></label><input type="checkbox" id="sn-15" class="sidenote-toggle"><span class="sidenote">The absmax figure in section 3 shows this too: its “multiply everything by” slider changes the scale <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>s</mi></mrow><annotation encoding="application/x-tex">s</annotation></semantics></math></span> but never the integers <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>q</mi><mi>i</mi></msub></mrow><annotation encoding="application/x-tex">q_i</annotation></semantics></math></span>.</span></span></span></p>
+
+<div class="katex-display"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><msub><mi>s</mi><mi>q</mi></msub><mo>=</mo><mfrac><mrow><munder><mrow><mi>max</mi><mo>⁡</mo></mrow><mi>j</mi></munder><mi mathvariant="normal">∣</mi><msub><mi>u</mi><mi>j</mi></msub><mi mathvariant="normal">∣</mi></mrow><mn>127</mn></mfrac><mo>=</mo><mfrac><mrow><munder><mrow><mi>max</mi><mo>⁡</mo></mrow><mi>j</mi></munder><mi mathvariant="normal">∣</mi><msub><mi>w</mi><mi>j</mi></msub><msub><mi>x</mi><mi>j</mi></msub><mi mathvariant="normal">∣</mi></mrow><mrow><mn>127</mn><mtext> </mtext><mi>r</mi></mrow></mfrac></mrow><annotation encoding="application/x-tex">s_q = \frac{\max_j |u_j|}{127} = \frac{\max_j |w_j x_j|}{127\, r}</annotation></semantics></math></span></div>
+
+<p>So the engine skips dividing each element by <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>r</mi></mrow><annotation encoding="application/x-tex">r</annotation></semantics></math></span>,</span> and computes one square root per normalisation instead of one division per element.</p>
+</div>
+
+<div data-sec="8.6">
+<h3 id="result">Result</h3>
+
+<p>Together these brought the time to <strong>169 ms per token</strong>, later measured at <strong>163 ms (6.1 tokens/s)</strong> in the benchmark. This round is not bit-exact, which the next section checks.</p>
+</div>
+</section>
+
+<section data-sec="9">
+<h2 id="9-did-it-change-the-answers">9. Did it change the answers?</h2>
+
+<p>Fixed point rounds differently from float, so we compared the new engine with the bit-exact one on a 41-token prompt, position by position:</p>
+
+<ul>
+<li><strong>Top choice:</strong> the same next token at 40 of 41 positions.</li>
+<li><strong>Whole distribution:</strong> the mean <a href="https://en.wikipedia.org/wiki/Kullback%E2%80%93Leibler_divergence">KL (Kullback–Leibler) divergence</a> between the two engines' next-token probabilities was 0.002 <a href="https://en.wikipedia.org/wiki/Nat_(unit)">nats</a>. KL divergence measures how different two probability distributions are; 0 means identical, and 0.002 is tiny.<span class="sidenote-wrap"><label for="sn-16" class="sidenote-number"></label><input type="checkbox" id="sn-16" class="sidenote-toggle"><span class="sidenote">The probabilities come from the 9,501 logits through the <a href="https://en.wikipedia.org/wiki/Softmax_function">softmax</a>, <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>p</mi><mi>v</mi></msub><mo>=</mo><msup><mi>e</mi><msub><mrow><mi mathvariant="normal">l</mi><mi mathvariant="normal">o</mi><mi mathvariant="normal">g</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">t</mi></mrow><mi>v</mi></msub></msup><mi mathvariant="normal">/</mi><msub><mo>∑</mo><mi>u</mi></msub><msup><mi>e</mi><msub><mrow><mi mathvariant="normal">l</mi><mi mathvariant="normal">o</mi><mi mathvariant="normal">g</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">t</mi></mrow><mi>u</mi></msub></msup></mrow><annotation encoding="application/x-tex">p_v = e^{\mathrm{logit}_v} / \sum_u e^{\mathrm{logit}_u}</annotation></semantics></math></span>.</span> KL divergence is <span class="bx-nowrap"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mo>∑</mo><mi>v</mi></msub><msub><mi>p</mi><mi>v</mi></msub><mi>ln</mi><mo>⁡</mo><mo stretchy="false">(</mo><msub><mi>p</mi><mi>v</mi></msub><mi mathvariant="normal">/</mi><msubsup><mi>p</mi><mi>v</mi><mo mathvariant="normal" lspace="0em" rspace="0em">′</mo></msubsup><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">\sum_v p_v \ln (p_v / p&#x27;_v)</annotation></semantics></math></span>:</span> the average extra surprise if you expected one engine's probabilities and got the other's.</span></span></li>
+<li><strong>On the device:</strong> with greedy decoding (always taking the top token), four of five test prompts gave word-for-word identical replies. The fifth recommended a different book.</li>
+</ul>
+</section>
+
+<section data-sec="10">
+<h2 id="10-the-app-around-the-engine">10. The app around the engine</h2>
+
+<p>The engine is about a quarter of the code. The rest makes it usable:</p>
+
+<ul>
+<li><strong>Tokenizer</strong> (<code>tokenizer.c</code>). brain-ai uses a <a href="https://github.com/google/sentencepiece">SentencePiece</a> “<a href="https://arxiv.org/abs/1804.10959">unigram</a>” vocabulary: each of the 9,501 pieces has a score, and the best split of a sentence is the one with the highest total score. The encoder finds it with the <a href="https://en.wikipedia.org/wiki/Viterbi_algorithm">Viterbi algorithm</a> (<a href="https://en.wikipedia.org/wiki/Dynamic_programming">dynamic programming</a> over byte positions), and falls back to raw <a href="https://en.wikipedia.org/wiki/UTF-8">UTF-8</a> (Unicode Transformation Format, 8-bit) bytes for characters not in the vocabulary.<span class="sidenote-wrap"><label for="sn-17" class="sidenote-number"></label><input type="checkbox" id="sn-17" class="sidenote-toggle"><span class="sidenote">To check whether a stretch of bytes is a known piece, the tokenizer hashes it with <a href="https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function">FNV-1a</a> (Fowler–Noll–Vo), a tiny hash: XOR each byte in, multiply by a fixed prime, repeat.</span></span></li>
+<li><strong>Screen</strong> (<code>main.c</code>). The Linux text console cannot draw kanji. Started on it, brainai runs itself again inside <a href="https://code.google.com/archive/p/fbterm/">fbterm</a>, a framebuffer terminal that draws text with <a href="https://freetype.org/">FreeType</a> and the WenQuanYi Zen Hei font. Both are ready-made Buildroot packages.</li>
+<li><strong>Input</strong> (<code>ui_tty.c</code>, <code>text.c</code>). The app edits the input line itself, so <a href="https://en.wikipedia.org/wiki/Romanization_of_Japanese">romaji</a> typed at the prompt is shown converted to <a href="https://en.wikipedia.org/wiki/Hiragana">hiragana</a> as you type; text in <code>[ ]</code> is left alone.</li>
+<li><strong>Tools</strong> (<code>main.c</code>). The model was trained to call tools by emitting a special token, a call such as <code>calc: 123*45</code>, and an end token. The app runs <code>calc</code>, <code>time</code>, <code>memo</code> and <code>search</code>, then feeds the result back in.</li>
+<li><strong>Exact arithmetic.</strong> The original app contains an arithmetic unit it calls “IGC”, which is not part of the published weights. As a stand-in, the app finds an arithmetic expression in your message, computes it exactly, and when the model starts writing digits after “は” or “=”, it inserts the exact number instead. So <code>123*45は？</code> really answers 5535.</li>
+<li><strong>Over <a href="https://en.wikipedia.org/wiki/Secure_Shell">SSH</a> (Secure Shell)</strong>, the same terminal UI runs in your own terminal.</li>
+</ul>
+</section>
+
+<section data-sec="11">
+<h2 id="11-results-and-what-is-left">11. Results and what is left</h2>
+
+<div class="wide"><table>
+<thead><tr><th>Version</th><th>ms/token</th><th>tokens/s</th></tr></thead>
+<tbody>
+<tr><td>First working engine</td><td>331</td><td>3.0</td></tr>
+<tr><td>Cache-sized blocks, four rows per word, DSP LM head (bit-exact)</td><td>257</td><td>3.9</td></tr>
+<tr><td>Fixed-point layers</td><td>163</td><td>6.1</td></tr>
+</tbody>
+</table></div>
+
+<p>In the app, the same prompt three times generated at 5.91, 5.91 and 5.88 tokens/s (the app also samples and prints), and reading the prompt dropped from 3.2 s to 1.4 s. Peak memory use is 8.6 MB.</p>
+
+<p>Where the remaining 163 ms go:</p>
+
+<pre class="diagram wide">
+ ternary matrices   68 ms  ████████████████████████████████
+ LM head            49 ms  ███████████████████████   (22 ms of it: reading 3.65 MB)
+ SSM update         27 ms  █████████████
+ convolution        14 ms  ███████
+ everything else    10 ms  █████
+</pre>
+
+<p>Ideas not yet tried:</p>
+
+<ul>
+<li><strong>LM head:</strong> process two vocabulary rows per pass, so each prepared <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>q</mi></mrow><annotation encoding="application/x-tex">q</annotation></semantics></math></span> pair is loaded once for two rows.</li>
+<li><strong>SSM:</strong> keep the <span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mo>∑</mo><mi>n</mi></msub><msub><mi>S</mi><mi>n</mi></msub><msub><mi>C</mi><mi>n</mi></msub></mrow><annotation encoding="application/x-tex">\sum_n S_n C_n</annotation></semantics></math></span> accumulation in 32 bits with the <code>SMLAWB</code> instruction instead of 64-bit multiply-adds.</li>
+<li><strong>Shortlist scoring:</strong> score only likely candidate words instead of all 9,501. Faster, but it changes the model's output, so it is a design choice rather than a free speedup.</li>
+</ul>
+
+<p>The lesson matches what smolmaxxing found on much bigger ARM chips: on small devices, how data moves through memory matters more than how much arithmetic you do. On a CPU without an FPU, there is a second lesson: floating point is not free just because it is “only a few elements”.</p>
+</section>
+
+<hr>
+
+<p class="colophon"><em>Source: <a href="https://github.com/tslmy/brainux-brainai">github.com/tslmy/brainux-brainai</a>. Model: <a href="https://huggingface.co/yamada2wasabi/brain-ai-v1-preview">brain-ai v1 preview</a> by yamada2wasabi, <a href="https://creativecommons.org/licenses/by-sa/4.0/">CC BY-SA 4.0</a>. Parts of this engine and article were written with AI assistance.</em></p>
+
+      </div>
+    </article>
+    <footer class="site">MIT-licensed engine and article · <a href="https://github.com/tslmy/brainux-brainai/blob/main/docs/how-it-works.md">plain Markdown version</a></footer>
+    <script src="assets/explainer.js" defer></script>
+  </body>
+</html>

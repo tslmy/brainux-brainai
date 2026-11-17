@@ -1,0 +1,595 @@
+<!--
+  Source of the interactive explainer. Edit this file, then run
+    deno run -A docs/src/build.mjs
+  which turns $…$ / $$…$$ into MathML and <sn>…</sn> into margin notes,
+  and writes docs/index.html and docs/blog/brainai-how-it-works.md.
+    Section numbers and anchors match docs/how-it-works.md; the engine sources
+  point to them, so keep them stable.
+-->
+<p class="reading-guide">Every symbol in the maths is clickable: hover over it, tap it, or focus it with the keyboard to see what it stands for. The boxed figures are live. Drag, click and type in them.</p>
+
+<p>SHARP Brain is a line of Japanese electronic dictionaries. Under the hood, they are small ARM computers, and the <a href="https://github.com/brain-hackers/buildbrain">Brainux</a> project runs Linux on them. In late 2026, the developer yamada2wasabi released <a href="https://huggingface.co/yamada2wasabi/brain-ai-v1-preview">brain-ai</a>, a tiny Japanese chat model designed for exactly this kind of device, together with an app for the Brain's stock <a href="https://en.wikipedia.org/wiki/Windows_Embedded_Compact">Windows CE</a> (Compact Edition) system. That app is closed source and does not run on Linux.</p>
+
+<p>This article describes the engine we wrote to run the same model on Brainux: first how it works at all, then how we made it twice as fast. Every number below was measured on a PW-SA3.<sn>A plain-Markdown version of this article lives in the repository as <a href="https://github.com/tslmy/brainux-brainai/blob/main/docs/how-it-works.md"><code>docs/how-it-works.md</code></a>. The engine's source comments point to its section numbers, which this page keeps.</sn></p>
+
+<nav class="toc" aria-label="Contents">
+<h2 id="contents">Contents</h2>
+<ol>
+<li><a href="#1-the-hardware">The hardware</a></li>
+<li><a href="#2-the-model">The model</a></li>
+<li><a href="#3-getting-the-model-onto-the-device">Getting the model onto the device</a></li>
+<li><a href="#4-ternary-weights-multiplying-without-multiplying">Ternary weights: multiplying without multiplying</a></li>
+<li><a href="#5-measure-first">Measure first</a></li>
+<li><a href="#6-rearranging-the-weights-for-the-cache">Rearranging the weights for the cache</a></li>
+<li><a href="#7-scoring-the-vocabulary-with-dsp-instructions">Scoring the vocabulary with DSP (digital signal processing) instructions</a></li>
+<li><a href="#8-replacing-floating-point-with-integers">Replacing floating point with integers</a></li>
+<li><a href="#9-did-it-change-the-answers">Did it change the answers?</a></li>
+<li><a href="#10-the-app-around-the-engine">The app around the engine</a></li>
+<li><a href="#11-results-and-what-is-left">Results and what is left</a></li>
+</ol>
+</nav>
+
+<section data-sec="1">
+<h2 id="1-the-hardware">1. The hardware</h2>
+
+<p>The PW-SA3 is built around an NXP i.MX283 <a href="https://en.wikipedia.org/wiki/System_on_a_chip">SoC</a> (system on a chip):</p>
+
+<div class="wide"><table>
+<thead><tr><th>Part</th><th>What it means for us</th></tr></thead>
+<tbody>
+<tr><td><a href="https://en.wikipedia.org/wiki/ARM9">ARM926EJ-S</a> core, 454 MHz, ARMv5TE instruction set</td><td>One instruction at a time, no out-of-order execution</td></tr>
+<tr><td>No <a href="https://en.wikipedia.org/wiki/Floating-point_unit">FPU</a> (floating-point unit)</td><td>Every <code>float</code> operation is emulated in software, costing tens of instructions</td></tr>
+<tr><td>No <a href="https://en.wikipedia.org/wiki/Single_instruction,_multiple_data">SIMD</a> (single instruction, multiple data) unit, no NEON</td><td>No vector maths; one number at a time</td></tr>
+<tr><td>A few <a href="https://en.wikipedia.org/wiki/Digital_signal_processor">DSP</a> instructions</td><td>16-bit × 16-bit and 32-bit × 16-bit multiplies in a single instruction</td></tr>
+<tr><td>16 KiB data <a href="https://en.wikipedia.org/wiki/CPU_cache">cache</a>, blocking</td><td>A cache miss stalls the whole CPU (central processing unit) until memory answers</td></tr>
+<tr><td>128 MB of RAM (random-access memory), 115 MB visible to Linux</td><td>Plenty for a 6.7 MB model, but slow</td></tr>
+</tbody>
+</table></div>
+
+<p>We measured memory bandwidth with a small read loop:</p>
+
+<pre class="diagram">
+  data size     read speed
+  ─────────     ──────────
+     8 KiB      518 MB/s   ← fits in the 16 KiB cache
+    64 KiB      192 MB/s   ← spills out of the cache
+   DRAM         168 MB/s   ← DRAM (dynamic RAM), i.e. main memory
+</pre>
+
+<p>Two lessons fall out of this table, and they drive every optimisation later:</p>
+
+<ul>
+<li><strong>Avoid <code>float</code>.</strong> Without an FPU, a single <code>a * b</code> on floats is a function call.<sn>The compiler turns it into a call to a library routine (<code>__aeabi_fmul</code>) that unpacks both numbers' signs, exponents and mantissas, multiplies the mantissas with integer instructions, then rounds and repacks the result.</sn></li>
+<li><strong>Keep the working set under 16 KiB.</strong> Anything that does not fit is read at a third of the speed.</li>
+</ul>
+</section>
+
+<section data-sec="2">
+<h2 id="2-the-model">2. The model</h2>
+
+<p>brain-ai v1 preview combines two ideas.</p>
+
+<p><strong><a href="https://huggingface.co/docs/transformers/en/model_doc/mamba2">Mamba-2</a> instead of a <a href="https://en.wikipedia.org/wiki/Transformer_(deep_learning_architecture)">Transformer</a>.</strong> A Transformer looks back at every previous token at each step, so its memory and time grow with the conversation. Mamba-2 is an <a href="https://www.ibm.com/think/topics/state-space-model">SSM</a> (state space model): each layer keeps a fixed-size <em>state</em> and updates it once per token. The cost per token is constant, which is exactly what a small device wants.</p>
+
+<p><strong><a href="https://en.wikipedia.org/wiki/1.58-bit_large_language_model">BitNet b1.58</a> weights.</strong> In the big matrices, every weight is −1, 0 or +1, times one scale per matrix.<sn>Three possible values carry $\log_2 3 \approx 1.58$ bits of information, hence the name.</sn> The inputs to those matrices are rounded to 8-bit integers (int8) per token. A matrix–vector product therefore needs only additions and subtractions of small integers.</p>
+
+<p>The sizes:</p>
+
+<div class="wide"><table>
+<thead><tr><th>Symbol</th><th>Value</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>$V$</td><td>9,501</td><td>vocabulary size (tokens)</td></tr>
+<tr><td>$D$</td><td>384</td><td>width of the vector passed between layers</td></tr>
+<tr><td>$L$</td><td>12</td><td>layers</td></tr>
+<tr><td>$E$</td><td>768</td><td>inner width of each layer ($2D$)</td></tr>
+<tr><td>$H \times P$</td><td>16 × 48</td><td>16 heads of 48 channels ($= E$)</td></tr>
+<tr><td>$N$</td><td>32</td><td>state size per channel</td></tr>
+<tr><td>$K$</td><td>4</td><td>convolution width (tokens)</td></tr>
+</tbody>
+</table></div>
+
+<p>Two terms appear in the diagram below. <a href="https://en.wikipedia.org/wiki/Swish_function">SiLU</a> (sigmoid linear unit) is the activation function $\operatorname{SiLU}(x) = x \cdot \sigma(x)$, where $\sigma(x) = 1 / (1 + e^{-x})$ is the <a href="https://en.wikipedia.org/wiki/Sigmoid_function">sigmoid</a>.<sn>An activation function bends a layer's output so that stacked layers can model more than a straight line. SiLU lets positive values through almost unchanged and squashes negative ones towards zero, smoothly.</sn> The LM (language model) head is the last step, which scores every vocabulary word; it reuses the <a href="https://en.wikipedia.org/wiki/Word_embedding">embedding</a> table, which is why the model is called “tied”.<sn>Sharing the input and output tables is known as <a href="https://arxiv.org/abs/1608.05859">weight tying</a> (Press and Wolf, 2016). Here it saves 3.65 MB, more than half the model file.</sn></p>
+
+<p>One step, for one token, looks like this:</p>
+
+<pre class="diagram wide">
+ token id
+    │
+    ▼
+ ┌────────────────────┐
+ │ embedding lookup   │  row `token` of a 9,501 × 384 table
+ └─────────┬──────────┘
+           │ x  (384 numbers)
+           ▼
+ ╔═══════════════════════════════════════════════════════════╗
+ ║  layer 1 … 12                                             ║
+ ║                                                           ║
+ ║   x ──► normalise ──► round to int8 ──► ternary matrix    ║
+ ║                                         384 → 1,616       ║
+ ║            ┌──────────────┬───────────┬────────┬──────┐   ║
+ ║            ▼              ▼           ▼        ▼      ▼   ║
+ ║          gate z      signal x'       B        C     step  ║
+ ║          (768)        (768)        (32)     (32)  dt (16) ║
+ ║            │              └─────┬─────┴────────┘      │   ║
+ ║            │                    ▼                     │   ║
+ ║            │        4-token convolution + SiLU        │   ║
+ ║            │                    │                     │   ║
+ ║            │                    ▼                     │   ║
+ ║            │         SSM state update  ◄──────────────┘   ║
+ ║            │         (16 × 48 × 32 numbers kept)          ║
+ ║            │                    │ y (768)                 ║
+ ║            └──────► y · SiLU(z), normalise, round to int8 ║
+ ║                                 │                         ║
+ ║                                 ▼                         ║
+ ║                     ternary matrix 768 → 384              ║
+ ║                                 │                         ║
+ ║   x  ◄──────────── x + result ──┘                         ║
+ ╚═══════════════════════════════════════════════════════════╝
+           │
+           ▼
+ ┌────────────────────┐
+ │ normalise, score   │  dot product with all 9,501 rows of
+ │ every vocabulary   │  the same embedding table
+ │ word ("LM head")   │
+ └─────────┬──────────┘
+           ▼
+   9,501 scores ("logits") → pick the next token
+</pre>
+
+<p>The heart of the layer is the SSM state update. For each head $h$, channel $p$ and state index $n$:</p>
+
+$$
+\begin{aligned}
+\Delta_h &= \operatorname{softplus}(\mathit{dt}_h + b_h) = \ln\!\left(1 + e^{\mathit{dt}_h + b_h}\right) \\
+\bar{A}_h &= e^{\Delta_h A_h} \qquad (A_h \lt 0,\ \text{so } 0 \lt \bar{A}_h \lt 1) \\
+S_{h,p,n} &\leftarrow \bar{A}_h \, S_{h,p,n} + \Delta_h \, x_{h,p} \, B_n \\
+y_{h,p} &= \sum_{n} S_{h,p,n} \, C_n + D_h \, x_{h,p}
+\end{aligned}
+$$
+
+<p>In words: the old state fades by a factor $\bar{A}_h$, the new input is added in through $B$, and the output is read back out through $C$. The state $S$ is the model's whole memory of the conversation: 16 × 48 × 32 = 24,576 numbers per layer, regardless of how long you chat.<sn><a href="https://en.wikipedia.org/wiki/Softplus">Softplus</a> is a smooth version of “clip negatives to zero”, so the step size $\Delta$ is always positive. A bigger $\Delta$ means “this token matters”: the state forgets more of the past and takes in more of the present.</sn></p>
+
+<figure class="widget wide" data-widget="ssm">
+<figcaption><strong>Try it: one state number over 32 tokens.</strong> Click the token slots to place inputs, then move the sliders. The real layer runs 24,576 of these side by side, each head with its own $\bar{A}_h$, each state index with its own $B_n$ and $C_n$.</figcaption>
+<noscript><p>This figure needs JavaScript.</p></noscript>
+</figure>
+</section>
+
+<section data-sec="3">
+<h2 id="3-getting-the-model-onto-the-device">3. Getting the model onto the device</h2>
+
+<p>The <a href="https://huggingface.co/">Hugging Face</a> release stores everything as 32-bit floats in a <a href="https://huggingface.co/docs/safetensors"><code>safetensors</code></a> file. A converter script (<code>tools/convert.py</code>, standard-library Python only, so it runs inside the <a href="https://buildroot.org/">Buildroot</a> build) rewrites it into a compact <code>model.bin</code>:</p>
+
+<pre class="diagram">
+ model.bin
+ ┌──────────────────────────────────────────────────────────┐
+ │ "BRAI"  version  V D L E N H P K          (40 bytes)     │
+ ├──────────────────────────────────────────────────────────┤
+ │ embedding: 9,501 row scales (float)                      │
+ │            9,501 × 384 int8 values         3.65 MB       │
+ ├──────────────────────────────────────────────────────────┤
+ │ layer 1:  norm weights (float)                           │
+ │           input matrix: scale + 1,616 × 384 ternary      │
+ │                         packed 4 per byte  155 KB        │
+ │           conv weights, biases, dt bias, A, D (float)    │
+ │           gate-norm weights (float)                      │
+ │           output matrix: scale + 384 × 768 ternary       │
+ │                          packed 4 per byte  74 KB        │
+ ├──────────────────────────────────────────────────────────┤
+ │ layer 2 … layer 12  (same layout)                        │
+ ├──────────────────────────────────────────────────────────┤
+ │ final norm weights (float)                               │
+ └──────────────────────────────────────────────────────────┘
+                                         total 6.7 MB
+</pre>
+
+<p><strong>Packing ternary weights.</strong> A weight $w \in \{-1, 0, +1\}$ becomes a digit $d = w + 1 \in \{0, 1, 2\}$. Four digits make a number in <a href="https://en.wikipedia.org/wiki/Ternary_numeral_system">base 3</a>:</p>
+
+$$
+c = d_0 + 3 d_1 + 9 d_2 + 27 d_3, \qquad 0 \le c \le 80
+$$
+
+<p>Since $3^4 = 81 \le 256$, four weights fit in one byte.<sn>Two bits per weight would also fit four in a byte, but base 3 gives us something more useful: a table index, as the next section shows.</sn></p>
+
+<pre class="diagram">
+ weights   +1   0  −1  +1
+ digits     2   1   0   2
+ code      2·1 + 1·3 + 0·9 + 2·27 = 59   → one byte: 59
+</pre>
+
+<p><strong>Quantising the embedding.</strong> Each of the 9,501 embedding rows gets its own scale $s_v = \max_i |e_{v,i}| / 127$, and each value is stored as $\operatorname{round}(e_{v,i} / s_v)$, an int8.<sn>This is “absmax” quantisation: the largest value in the row becomes ±127, and everything else is scaled by the same factor. One number per row, $s_v$, is enough to undo it.</sn></p>
+
+<figure class="widget wide" data-widget="absmax">
+<figcaption><strong>Try it: absmax rounding to int8.</strong> Drag the bars. The faint outline is what comes back after rounding, $q_i \cdot s$. Add an outlier and watch every other value lose precision.</figcaption>
+<noscript><p>This figure needs JavaScript.</p></noscript>
+</figure>
+
+<p>The tokenizer file (<code>tokenizer.model</code>, a <a href="https://protobuf.dev/">protobuf</a>, Google's binary serialisation format) is parsed by hand into <code>tok.bin</code>.</p>
+</section>
+
+<section data-sec="4">
+<h2 id="4-ternary-weights-multiplying-without-multiplying">4. Ternary weights: multiplying without multiplying</h2>
+
+<p>A matrix–vector product computes, for each output row $r$:</p>
+
+$$
+\operatorname{out}_r = \sum_{c} W_{r,c} \, q_c
+$$
+
+<p>With $W_{r,c} \in \{-1, 0, +1\}$, each term is $+q_c$, $0$ or $-q_c$. Still, deciding which, one weight at a time, costs a few instructions per weight.</p>
+
+<p>The trick, used in the <a href="https://arxiv.org/abs/2407.00088">T-MAC</a> paper (Wei et al., 2024, on table lookups for low-bit models on edge CPUs) and in the <a href="https://github.com/hyperionaidev/smolmaxxing">smolmaxxing</a> project, is to take the inputs <strong>four at a time</strong>. Four inputs $q_0, q_1, q_2, q_3$ can meet only $3^4 = 81$ different weight patterns, so we compute all 81 possible sums once and store them in a <a href="https://en.wikipedia.org/wiki/Lookup_table">LUT</a> (lookup table):</p>
+
+$$
+T[c] = \sum_{k=0}^{3} (d_k - 1)\, q_k \qquad \text{for every } c = d_0 + 3d_1 + 9d_2 + 27d_3
+$$
+
+<p>Then each packed weight byte <em>is</em> the index of the answer:</p>
+
+$$
+\sum_{k=0}^{3} W_{r,4g+k} \, q_{4g+k} = T_g[\mathrm{byte}_{r,g}]
+$$
+
+<figure class="widget wide" data-widget="lut">
+<figcaption><strong>Try it: the 81-entry table for one group of four inputs.</strong> Change the inputs or click the weights. Every cell of the 9 × 9 grid is one possible weight pattern; click a cell to see which. The grid's rows and columns are the two halves of the code, explained below the figure.</figcaption>
+<pre class="diagram">
+ inputs of group g:   q0 = 5   q1 = −2   q2 = 7   q3 = 1
+ table T_g (81 entries, built once per token per group):
+   c:     0     1     2     3   …    59   …    80
+        ───   ───   ───   ───       ───        ───
+        −11    −6    −1   −13   …    −1   …    11
+                                      ▲
+ row r's byte for group g: 59 ────────┘   (weights +1 0 −1 +1)
+                     check: 5·1 + (−2)·0 + 7·(−1) + 1·1 = −1
+ T[0]  is all weights −1:  −5 + 2 − 7 − 1 = −11
+ T[80] is all weights +1:   5 − 2 + 7 + 1 =  11
+ one table read replaces four multiply-adds
+</pre>
+</figure>
+
+<p>Building the 81 entries naively would cost 81 × 4 multiply-adds. Instead, the engine splits the code into a low half $i = d_0 + 3d_1$ and a high half $j = d_2 + 3d_3$, computes 9 partial sums for each half, and adds them:</p>
+
+$$
+T[i + 9j] = \underbrace{(d_0 - 1) q_0 + (d_1 - 1) q_1}_{\mathrm{lo}[i],\ 9 \text{ values}}
+          + \underbrace{(d_2 - 1) q_2 + (d_3 - 1) q_3}_{\mathrm{hi}[j],\ 9 \text{ values}}
+$$
+
+<p>That is 18 small sums and 81 additions per group of four inputs. Every one of the 1,616 rows then reuses the table, so building it is cheap by comparison.<sn>In the figure above, the shaded header column holds the 9 values of $\mathrm{lo}[i]$ and the header row the 9 values of $\mathrm{hi}[j]$. Each cell is just its row header plus its column header.</sn></p>
+
+<p>Finally, the integer result is turned back into a real number with two scales: the matrix's weight scale $s_W$ and the input's rounding scale $s_q$:</p>
+
+$$
+\operatorname{out}_r^{\text{real}} = s_W \cdot s_q \cdot \sum_c W_{r,c}\, q_c
+$$
+
+<p>This version ran at <strong>331 ms per token (3.0 tokens per second)</strong>. It worked, and it was slow.</p>
+</section>
+
+<section data-sec="5">
+<h2 id="5-measure-first">5. Measure first</h2>
+
+<p>Before changing anything, we added a benchmark (<code>bench</code>) with an optional per-stage timer (build with <code>-DBRAINAI_PROF</code>). It feeds tokens through the model and reports the time spent in each part. The first profile:</p>
+
+<pre class="diagram wide">
+ stage                              ms/token   share
+ ─────                              ────────   ─────
+ ternary matrices (incl. tables)       127     ████████████████████  38%
+ LM head (scoring 9,501 words)          69     ███████████           21%
+ convolution + SiLU                     51     ████████              15%
+ gate + normalisation                   43     ███████               13%
+ SSM state update                       34     █████                 10%
+ other                                   7     █                      2%
+                                       ───
+                                       331
+</pre>
+
+<p>The surprise: the ternary maths we had designed for was barely a third of the time. Small per-element work done in emulated floating point (the convolution, SiLU, the gate, the normalisation) added up to more.</p>
+</section>
+
+<section data-sec="6">
+<h2 id="6-rearranging-the-weights-for-the-cache">6. Rearranging the weights for the cache</h2>
+
+<p><strong>Problem 1: the tables did not fit in the cache.</strong> The input matrix has 384 inputs, so 96 groups of four, so 96 tables of 81 entries. At 2 bytes per entry that is 96 × 162 = 15.5 KiB, the entire data cache. As the weights streamed through, they pushed the tables out, and every lookup risked a miss.</p>
+
+<p><strong>Fix: column blocks.</strong> At load time, the engine reorders the weights in place into blocks of 32 groups (128 columns). It builds the 32 tables for one block (32 × 162 bytes ≈ 5 KiB, comfortably cached), runs every row over that block, then moves on to the next block and adds to the running sums.</p>
+
+<pre class="diagram">
+ original layout: each row is one long line of bytes
+
+          group:   0    1    2   …   95
+ row 0           [b ][b ][b ]   … [b ]
+ row 1           [b ][b ][b ]   … [b ]
+ …
+ row 1615        [b ][b ][b ]   … [b ]
+
+          all 96 tables needed for every row  →  15.5 KiB of tables
+
+ repacked: three column blocks, processed one after another
+          ┌─ block 0 ─┐┌─ block 1 ─┐┌─ block 2 ─┐
+          groups 0–31   groups 32–63  groups 64–95
+                │
+                ▼
+          build 32 tables (5 KiB, stays in cache)
+          run all 1,616 rows over these 32 groups
+          then block 1, then block 2, adding up
+</pre>
+
+<p><strong>Problem 2: one byte per load.</strong> Reading one byte at a time from memory wastes three quarters of each 32-bit load.</p>
+
+<p><strong>Fix: four rows per word.</strong> Inside a block, rows are taken four at a time. For each group, the four rows' bytes sit next to each other in one 32-bit word. One load fetches the codes for four rows, and all four lookups use the same table:</p>
+
+<pre class="diagram">
+ inside a block, rows r … r+3, groups g = 0 … 31:
+  memory:  [ r  r+1 r+2 r+3 ] [ r  r+1 r+2 r+3 ] [ r  r+1 r+2 r+3 ] …
+           └──── group 0 ────┘ └──── group 1 ────┘ └──── group 2 ────┘
+                one 32-bit word     one word           one word
+
+  for each word v:
+     s0 += T[ v        &amp; 0xff ]   ← row r
+     s1 += T[ (v >> 8)  &amp; 0xff ]   ← row r+1
+     s2 += T[ (v >> 16) &amp; 0xff ]   ← row r+2
+     s3 += T[  v >> 24        ]   ← row r+3
+     T  += next group's table
+</pre>
+
+<figure class="widget wide" data-widget="repack">
+<figcaption><strong>Try it: the same weights in two memory orders.</strong> A small matrix (8 rows × 12 groups) stands in for the real one (1,616 rows × 96 groups). Press play to watch which bytes each load fetches and which tables must stay in the cache. The meter underneath does the sums for the real matrix and its block size $GB$.</figcaption>
+<noscript><p>This figure needs JavaScript.</p></noscript>
+</figure>
+
+<p><strong>Fix 3: store byte offsets, not indexes.</strong> Table entries are 16-bit, so entry $c$ lives at byte offset $2c$. The repacker stores $2c$ instead of $c$ (the largest code, 80, becomes 160, which still fits in a byte). The lookup becomes a single ARM <code>ldrsh</code> instruction (“load signed halfword from base + offset”) with no index arithmetic.</p>
+
+<p><strong>Two compiler details.</strong> The mask <code>0xff</code> is kept in a register (<a href="https://gcc.gnu.org/">GCC</a>, the GNU Compiler Collection, otherwise emits two instructions for “shift then mask with a constant”), and the table builder uses nested loops instead of computing <code>i % 3</code> and <code>i / 3</code> per entry, which are slow on a CPU without a divide instruction.<sn>ARMv5 has no integer divide instruction at all. A <code>/</code> or <code>%</code> by a variable becomes a call to a library routine that divides one bit at a time.</sn></p>
+
+<p>Block size turned out not to matter once the four-rows-per-word layout was in: 16, 32 and 48 groups per block all ran at about 257 ms per token. The win came from fitting in the cache at all, not from tuning.</p>
+</section>
+
+<section data-sec="7">
+<h2 id="7-scoring-the-vocabulary-with-dsp-instructions">7. Scoring the vocabulary with DSP instructions</h2>
+
+<p>At the end of each step, the model scores all 9,501 words: a <a href="https://en.wikipedia.org/wiki/Dot_product">dot product</a> between the final vector $q$ (384 int8 values) and every embedding row $e_v$:</p>
+
+$$
+\mathrm{logit}_v = s_v \cdot s_q \cdot \sum_{i=0}^{383} e_{v,i}\, q_i
+$$
+
+<p>That is 3.6 million multiply-adds per token, and reading 3.65 MB of embedding table. At 168 MB/s, the reading alone takes about 22 ms.</p>
+
+<p>The ARM926 has DSP instructions that treat a 32-bit register as two 16-bit halves:</p>
+
+<pre class="diagram">
+ SMLABB  acc += bottom16(a) × bottom16(b)
+ SMLATT  acc += top16(a)    × top16(b)
+
+ one instruction, one cycle, signed 16 × 16 → added to 32-bit acc
+</pre>
+
+<p>To feed them, we load <strong>four embedding bytes as one 32-bit word</strong> and split it into two words, each holding two bytes in its 16-bit halves:</p>
+
+<pre class="diagram">
+ word from the table:   [ b3 | b2 | b1 | b0 ]
+
+ w &amp; 0x00ff00ff       = [ 00 | b2 | 00 | b0 ]   halves: (b0, b2)
+ (w >> 8) &amp; 0x00ff00ff = [ 00 | b3 | 00 | b1 ]   halves: (b1, b3)
+
+ q prepared once per token as 16-bit pairs:
+   q2[0] = [ q2 | q0 ]
+   q2[1] = [ q3 | q1 ]
+
+ a += b0·q0  (SMLABB)      b += b2·q2  (SMLATT)
+ a += b1·q1  (SMLABB)      b += b3·q3  (SMLATT)
+</pre>
+
+<p>Masking only works if the bytes are <strong>unsigned</strong>: a negative byte would need its sign extended into the top 8 bits of its half. So at load time, every embedding byte is stored as $e + 128$ (a range of 0 to 255).<sn>In practice this is an <a href="https://en.wikipedia.org/wiki/Exclusive_or">XOR</a> (exclusive or) with <code>0x80</code>, which flips the top bit and turns the two's-complement byte −128…127 into 0…255.</sn> The extra $128$ is removed once per word, not per multiply:</p>
+
+$$
+\sum_i e_i\, q_i = \sum_i (e_i + 128)\, q_i \; - \; 128 \sum_i q_i
+$$
+
+<p>The second term, $128 \sum_i q_i$, is the same for all 9,501 rows, so it is computed once per token.</p>
+
+<p>The same section also fixed the sampler: the <a href="https://arxiv.org/abs/1909.05858">repetition penalty</a> used to scan the last 64 tokens for each of the 9,501 words (608,000 comparisons). Now it marks those 64 tokens in an array, checks the mark per word, and clears the marks afterwards.</p>
+
+<p>All of section 6 and this section are <strong>bit-exact</strong>: the logits were identical before and after, which we checked with a checksum after every change. Together they brought the time to <strong>257 ms per token (3.9 tokens/s)</strong>.<sn><code>bench</code> prints a checksum of the final logits after a fixed run, so any change that is supposed to be exact can be checked in one line.</sn></p>
+</section>
+
+<section data-sec="8">
+<h2 id="8-replacing-floating-point-with-integers">8. Replacing floating point with integers</h2>
+
+<p>The biggest single win. Everything element-wise inside a layer now uses 32-bit fixed-point integers.</p>
+
+<div data-sec="8.1">
+<h3 id="fixed-point-in-one-paragraph">Fixed point in one paragraph</h3>
+
+<p>A <a href="https://en.wikipedia.org/wiki/Fixed-point_arithmetic">fixed-point</a> number stores a real value $v$ as the integer $\operatorname{round}(v \cdot 2^f)$. We write this as <strong><a href="https://en.wikipedia.org/wiki/Q_(number_format)">Q$f$</a></strong>: Q16 means “16 fractional bits”, so the integer 98,304 in Q16 is $98{,}304 / 2^{16} = 1.5$. The rules are simple:</p>
+
+$$
+\begin{aligned}
+\mathrm{Q}a + \mathrm{Q}a &= \mathrm{Q}a \\
+\mathrm{Q}a \times \mathrm{Q}b &= \mathrm{Q}(a + b) \\
+\mathrm{Q}a \gg s &= \mathrm{Q}(a - s)
+\end{aligned}
+$$
+
+<p>So multiplying two Q16 numbers gives Q32, and shifting right by 16 brings it back to Q16. One integer multiply and one shift replace a software float multiply that costs tens of instructions.<sn>Think of it as counting in fixed small units, like storing money as whole cents. Q16 counts in units of $1/65{,}536$.</sn></p>
+
+<figure class="widget wide" data-widget="qformat">
+<figcaption><strong>Try it: one number in Q$f$.</strong> Type a value and move the binary point. More fractional bits give finer steps but a smaller range.</figcaption>
+<noscript><p>This figure needs JavaScript.</p></noscript>
+</figure>
+
+<p>The engine uses:</p>
+
+<div class="wide"><table>
+<thead><tr><th>Quantity</th><th>Format</th><th>Range</th></tr></thead>
+<tbody>
+<tr><td>activations ($z$, $x'$, $B$, $C$, $y$)</td><td>Q16</td><td>±32,768</td></tr>
+<tr><td>convolution weights</td><td>Q20</td><td>±2,048, finer steps for small weights</td></tr>
+<tr><td>SSM state $S$</td><td>Q20</td><td>±2,048</td></tr>
+<tr><td>decay $\bar{A}$</td><td>Q31</td><td>$[0, 1)$, as precise as 32 bits allow</td></tr>
+</tbody>
+</table></div>
+</div>
+
+<div data-sec="8.2">
+<h3 id="from-the-matrix-result-to-q16">From the matrix result to Q16</h3>
+
+<p>The ternary matrix produces an integer sum $a_r$. Its real value is $a_r \cdot s$, where $s$ is a float scale that changes per token. To get Q16 without a float per element, the engine converts $s$ once per token into an integer multiplier $m$ and shift $k$:</p>
+
+$$
+s = f \cdot 2^{e}\ \ (0.5 \le |f| \lt 1), \qquad m = f \cdot 2^{30}, \qquad k = 14 - e
+$$
+
+$$
+(a_r \cdot m) \gg k \;=\; a_r \cdot f \cdot 2^{30 - 14 + e} \;=\; a_r \cdot s \cdot 2^{16}
+$$
+
+<p>That is one 64-bit multiply and shift per element.<sn>Splitting $s$ into $f \cdot 2^e$ is what C's <code>frexpf</code> does; it is how a float is stored anyway, as a mantissa and an exponent.</sn></p>
+</div>
+
+<div data-sec="8.3">
+<h3 id="silu-with-a-table">SiLU with a table</h3>
+
+<p>$\sigma(x)$ needs $e^{-x}$, expensive without an FPU. Instead, the engine precomputes 1,025 values of $\sigma$ at load time, over $[-16, 16)$ in steps of $1/32$, and <a href="https://en.wikipedia.org/wiki/Linear_interpolation">interpolates linearly</a> between neighbours:</p>
+
+<figure class="widget wide" data-widget="sigmoid">
+<figcaption><strong>Try it: the sigmoid table.</strong> Move $x$. The zoomed view shows the two table entries around it and the straight line drawn between them.</figcaption>
+<pre class="diagram">
+ σ(x)
+ 1.0 ┤                          ●●●●●●●●●  (≥ 16: exactly 1)
+     │                      ●●●
+ 0.5 ┤                 ●●●●            each ● is one table entry,
+     │            ●●●                  1/32 apart
+ 0.0 ┤●●●●●●●●●●●                       (≤ −16: exactly 0)
+     └──────────────────────────────── x
+    −16              0               16
+ between entries i and i+1:   σ ≈ t[i] + (t[i+1] − t[i]) · frac
+</pre>
+</figure>
+
+<p>For $x$ in Q16, the table index and the fraction come straight out of the bits, because $2^{16} / 32 = 2^{11}$:</p>
+
+$$
+u = x + 16 \cdot 2^{16}, \qquad i = u \gg 11, \qquad \mathrm{frac} = (u \bmod 2^{11}) / 2^{11}
+$$
+
+<p>Then $\operatorname{SiLU}(x) = (x \cdot \sigma(x)) \gg 16$.</p>
+</div>
+
+<div data-sec="8.4">
+<h3 id="the-ssm-update-in-integers">The SSM update in integers</h3>
+
+<p>Recall the update $S \leftarrow \bar{A} S + \Delta\, x\, B$. Per layer there are 16 × 48 × 32 = 24,576 of them, so this inner loop matters:</p>
+
+<ul>
+<li>$\bar{A}$ is computed once per head (16 per layer, still in float) and stored as Q31: $\bar{A}_{Q31} = \bar{A} \cdot 2^{31}$. Then $\bar{A} \cdot S = (S \cdot \bar{A}_{Q31}) \gg 31$. The engine takes the high 32 bits of the 64-bit product (that is, $\gg 32$) and shifts left by one, which the CPU does in one <code>SMULL</code> instruction plus a shift.</li>
+<li>$\Delta x$ is computed once per channel in Q20.</li>
+<li>$B$ is scaled down to fit in 16 bits: $B_{16} = B \gg s_b$, where $s_b$ is the smallest shift that makes every $B_n$ fit. Then $\Delta x \cdot B = (\operatorname{SMULWB}(\Delta x, B_{16})) \ll s_b$, where <code>SMULWB</code> is the DSP instruction “32-bit × bottom 16 bits, keep the top 32 of the 48-bit result”, i.e. $(a \cdot b) \gg 16$.</li>
+</ul>
+
+<pre class="diagram">
+ per state element n (24,576 per layer):
+   decay:  hi = (S[n] × Ā_Q31) >> 32          SMULL, high word
+   input:  v  = SMULWB(Δx, B16[n]) &lt;&lt; s_b     one DSP instruction
+           S[n] = v + (hi &lt;&lt; 1)
+   output: acc += S[n] × C[n]                 64-bit multiply-add
+</pre>
+
+<figure class="widget wide" data-widget="smulwb">
+<figcaption><strong>Try it: one SMULWB, bit by bit.</strong> Set $\Delta x$ and $B$. The instruction ignores the top half of its second register, multiplies, and keeps only the top 32 of the 48 result bits.</figcaption>
+<noscript><p>This figure needs JavaScript.</p></noscript>
+</figure>
+</div>
+
+<div data-sec="8.5">
+<h3 id="normalisation-the-square-root-that-cancels">Normalisation: the square root that cancels</h3>
+
+<p>Both normalisation steps compute an <a href="https://arxiv.org/abs/1910.07467">RMSNorm</a> (<a href="https://en.wikipedia.org/wiki/Root_mean_square">root mean square</a> normalisation) and then immediately round the result to int8. Write $r = \sqrt{\tfrac{1}{n}\sum_i x_i^2}$ and $u_i = w_i x_i / r$. Rounding to int8 by the largest absolute value gives:</p>
+
+$$
+q_i = \operatorname{round}\!\left(127 \cdot \frac{u_i}{\max_j |u_j|}\right)
+    = \operatorname{round}\!\left(127 \cdot \frac{w_i x_i / r}{\max_j |w_j x_j| / r}\right)
+    = \operatorname{round}\!\left(127 \cdot \frac{w_i x_i}{\max_j |w_j x_j|}\right)
+$$
+
+<p>The $r$ cancels. The int8 values do not depend on the RMS at all; only the scale that goes with them does:<sn>The absmax figure in section 3 shows this too: its “multiply everything by” slider changes the scale $s$ but never the integers $q_i$.</sn></p>
+
+$$
+s_q = \frac{\max_j |u_j|}{127} = \frac{\max_j |w_j x_j|}{127\, r}
+$$
+
+<p>So the engine skips dividing each element by $r$, and computes one square root per normalisation instead of one division per element.</p>
+</div>
+
+<div data-sec="8.6">
+<h3 id="result">Result</h3>
+
+<p>Together these brought the time to <strong>169 ms per token</strong>, later measured at <strong>163 ms (6.1 tokens/s)</strong> in the benchmark. This round is not bit-exact, which the next section checks.</p>
+</div>
+</section>
+
+<section data-sec="9">
+<h2 id="9-did-it-change-the-answers">9. Did it change the answers?</h2>
+
+<p>Fixed point rounds differently from float, so we compared the new engine with the bit-exact one on a 41-token prompt, position by position:</p>
+
+<ul>
+<li><strong>Top choice:</strong> the same next token at 40 of 41 positions.</li>
+<li><strong>Whole distribution:</strong> the mean <a href="https://en.wikipedia.org/wiki/Kullback%E2%80%93Leibler_divergence">KL (Kullback–Leibler) divergence</a> between the two engines' next-token probabilities was 0.002 <a href="https://en.wikipedia.org/wiki/Nat_(unit)">nats</a>. KL divergence measures how different two probability distributions are; 0 means identical, and 0.002 is tiny.<sn>The probabilities come from the 9,501 logits through the <a href="https://en.wikipedia.org/wiki/Softmax_function">softmax</a>, $p_v = e^{\mathrm{logit}_v} / \sum_u e^{\mathrm{logit}_u}$. KL divergence is $\sum_v p_v \ln (p_v / p'_v)$: the average extra surprise if you expected one engine's probabilities and got the other's.</sn></li>
+<li><strong>On the device:</strong> with greedy decoding (always taking the top token), four of five test prompts gave word-for-word identical replies. The fifth recommended a different book.</li>
+</ul>
+</section>
+
+<section data-sec="10">
+<h2 id="10-the-app-around-the-engine">10. The app around the engine</h2>
+
+<p>The engine is about a quarter of the code. The rest makes it usable:</p>
+
+<ul>
+<li><strong>Tokenizer</strong> (<code>tokenizer.c</code>). brain-ai uses a <a href="https://github.com/google/sentencepiece">SentencePiece</a> “<a href="https://arxiv.org/abs/1804.10959">unigram</a>” vocabulary: each of the 9,501 pieces has a score, and the best split of a sentence is the one with the highest total score. The encoder finds it with the <a href="https://en.wikipedia.org/wiki/Viterbi_algorithm">Viterbi algorithm</a> (<a href="https://en.wikipedia.org/wiki/Dynamic_programming">dynamic programming</a> over byte positions), and falls back to raw <a href="https://en.wikipedia.org/wiki/UTF-8">UTF-8</a> (Unicode Transformation Format, 8-bit) bytes for characters not in the vocabulary.<sn>To check whether a stretch of bytes is a known piece, the tokenizer hashes it with <a href="https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function">FNV-1a</a> (Fowler–Noll–Vo), a tiny hash: XOR each byte in, multiply by a fixed prime, repeat.</sn></li>
+<li><strong>Screen</strong> (<code>main.c</code>). The Linux text console cannot draw kanji. Started on it, brainai runs itself again inside <a href="https://code.google.com/archive/p/fbterm/">fbterm</a>, a framebuffer terminal that draws text with <a href="https://freetype.org/">FreeType</a> and the WenQuanYi Zen Hei font. Both are ready-made Buildroot packages.</li>
+<li><strong>Input</strong> (<code>ui_tty.c</code>, <code>text.c</code>). The app edits the input line itself, so <a href="https://en.wikipedia.org/wiki/Romanization_of_Japanese">romaji</a> typed at the prompt is shown converted to <a href="https://en.wikipedia.org/wiki/Hiragana">hiragana</a> as you type; text in <code>[ ]</code> is left alone.</li>
+<li><strong>Tools</strong> (<code>main.c</code>). The model was trained to call tools by emitting a special token, a call such as <code>calc: 123*45</code>, and an end token. The app runs <code>calc</code>, <code>time</code>, <code>memo</code> and <code>search</code>, then feeds the result back in.</li>
+<li><strong>Exact arithmetic.</strong> The original app contains an arithmetic unit it calls “IGC”, which is not part of the published weights. As a stand-in, the app finds an arithmetic expression in your message, computes it exactly, and when the model starts writing digits after “は” or “=”, it inserts the exact number instead. So <code>123*45は？</code> really answers 5535.</li>
+<li><strong>Over <a href="https://en.wikipedia.org/wiki/Secure_Shell">SSH</a> (Secure Shell)</strong>, the same terminal UI runs in your own terminal.</li>
+</ul>
+</section>
+
+<section data-sec="11">
+<h2 id="11-results-and-what-is-left">11. Results and what is left</h2>
+
+<div class="wide"><table>
+<thead><tr><th>Version</th><th>ms/token</th><th>tokens/s</th></tr></thead>
+<tbody>
+<tr><td>First working engine</td><td>331</td><td>3.0</td></tr>
+<tr><td>Cache-sized blocks, four rows per word, DSP LM head (bit-exact)</td><td>257</td><td>3.9</td></tr>
+<tr><td>Fixed-point layers</td><td>163</td><td>6.1</td></tr>
+</tbody>
+</table></div>
+
+<p>In the app, the same prompt three times generated at 5.91, 5.91 and 5.88 tokens/s (the app also samples and prints), and reading the prompt dropped from 3.2 s to 1.4 s. Peak memory use is 8.6 MB.</p>
+
+<p>Where the remaining 163 ms go:</p>
+
+<pre class="diagram wide">
+ ternary matrices   68 ms  ████████████████████████████████
+ LM head            49 ms  ███████████████████████   (22 ms of it: reading 3.65 MB)
+ SSM update         27 ms  █████████████
+ convolution        14 ms  ███████
+ everything else    10 ms  █████
+</pre>
+
+<p>Ideas not yet tried:</p>
+
+<ul>
+<li><strong>LM head:</strong> process two vocabulary rows per pass, so each prepared $q$ pair is loaded once for two rows.</li>
+<li><strong>SSM:</strong> keep the $\sum_n S_n C_n$ accumulation in 32 bits with the <code>SMLAWB</code> instruction instead of 64-bit multiply-adds.</li>
+<li><strong>Shortlist scoring:</strong> score only likely candidate words instead of all 9,501. Faster, but it changes the model's output, so it is a design choice rather than a free speedup.</li>
+</ul>
+
+<p>The lesson matches what smolmaxxing found on much bigger ARM chips: on small devices, how data moves through memory matters more than how much arithmetic you do. On a CPU without an FPU, there is a second lesson: floating point is not free just because it is “only a few elements”.</p>
+</section>
+
+<hr>
+
+<p class="colophon"><em>Source: <a href="https://github.com/tslmy/brainux-brainai">github.com/tslmy/brainux-brainai</a>. Model: <a href="https://huggingface.co/yamada2wasabi/brain-ai-v1-preview">brain-ai v1 preview</a> by yamada2wasabi, <a href="https://creativecommons.org/licenses/by-sa/4.0/">CC BY-SA 4.0</a>. Parts of this engine and article were written with AI assistance.</em></p>

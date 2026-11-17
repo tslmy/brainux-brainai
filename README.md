@@ -27,7 +27,9 @@ unchanged.
 ## Engine
 
 [docs/how-it-works.md](docs/how-it-works.md) walks through the engine and
-its optimisations with diagrams and formulas. In short:
+its optimisations with diagrams and formulas. An interactive version with
+live figures and explained symbols is in [docs/index.html](docs/index.html),
+ready to serve with GitHub Pages from `docs/` (source: `docs/src/`). In short:
 
 - Ternary projections use an 81-entry lookup table per group of four int8
   activations (T-MAC style, as [smolmaxxing](https://github.com/hyperionaidev/smolmaxxing)
